@@ -3,10 +3,12 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev": "bun --hot index.ts"
+    "dev": "bun --hot index.ts",
+    "start": "npx tsx index.ts",
+    "build": "echo 'No build step needed'"
   },
   "dependencies": {
     "playwright": "^1.52.0",
-    "cors": "^2.8.5"
+    "tsx": "^4.19.0"
   }
 }
