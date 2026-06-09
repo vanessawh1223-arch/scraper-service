@@ -1,6 +1,6 @@
 FROM node:20-slim
 
-# Install Playwright dependencies
+# Install all Playwright system dependencies
 RUN apt-get update && apt-get install -y \
     libnss3 \
     libnspr4 \
@@ -17,6 +17,12 @@ RUN apt-get update && apt-get install -y \
     libcairo2 \
     libasound2 \
     libxshmfence1 \
+    libxfixes3 \
+    libx11-xcb1 \
+    libxcb-dri3-0 \
+    libdbus-1-3 \
+    libatspi2.0-0 \
+    libexpat1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -27,8 +33,8 @@ COPY package.json ./
 # Install dependencies
 RUN npm install
 
-# Install Playwright browsers
-RUN npx playwright install chromium
+# Install Playwright browsers with system dependencies
+RUN npx playwright install chromium --with-deps
 
 # Copy source code
 COPY index.ts ./
