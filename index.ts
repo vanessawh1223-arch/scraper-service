@@ -893,84 +893,121 @@ async function handleSemrushAds(req: Request): Promise<Response> {
 }
 
 // ---------------------------------------------------------------------------
-// Router
+// Router (Node.js HTTP server - compatible with Docker/Node.js runtime)
 // ---------------------------------------------------------------------------
 
-const PORT = 3001;
+import { createServer, type IncomingMessage, type ServerResponse } from "http";
 
-const server = Bun.serve({
-  port: PORT,
-  async fetch(req) {
-    try {
-      const url = new URL(req.url);
-      const method = req.method;
+const PORT = parseInt(process.env.PORT || "3001", 10);
 
-      // Handle CORS preflight
-      if (method === "OPTIONS") {
-        return new Response(null, {
-          status: 204,
-          headers: {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type",
-          },
-        });
-      }
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
 
-      // Health check
-      if (url.pathname === "/health" && method === "GET") {
-        return jsonResponse({ status: "ok", timestamp: Date.now() });
-      }
+function sendJson(res: ServerResponse, data: unknown, status = 200) {
+  const body = JSON.stringify(data);
+  res.writeHead(status, { "Content-Type": "application/json", ...CORS_HEADERS });
+  res.end(body);
+}
 
-      // Extract landing page URL
-      if (url.pathname === "/api/extract" && method === "POST") {
-        return await handleExtract(req);
-      }
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
 
-      // SEMrush domain overview
-      if (url.pathname === "/api/semrush/domain" && method === "POST") {
-        return await handleSemrushDomain(req);
-      }
+function toFetchRequest(req: IncomingMessage, body: string): Request {
+  const protocol = (req.headers["x-forwarded-proto"] as string) || "http";
+  const host = req.headers.host || "localhost";
+  const url = `${protocol}://${host}${req.url}`;
+  return new Request(url, {
+    method: req.method,
+    headers: req.headers as Record<string, string>,
+    body: req.method === "GET" || req.method === "HEAD" ? undefined : body,
+  });
+}
 
-      // SEMrush ad copies
-      if (url.pathname === "/api/semrush/ads" && method === "POST") {
-        return await handleSemrushAds(req);
-      }
+async function handleRequest(req: IncomingMessage, res: ServerResponse) {
+  const url = new URL(req.url || "/", `http://localhost:${PORT}`);
+  const method = req.method || "GET";
 
-      // 404
-      return jsonResponse({ error: "Not found" }, 404);
-    } catch (err) {
-      console.error("Unhandled error in fetch handler:", err);
-      return jsonResponse(
-        {
-          success: false,
-          error: "Internal server error",
-          details: err instanceof Error ? err.message : String(err),
-        },
-        500
-      );
+  // Handle CORS preflight
+  if (method === "OPTIONS") {
+    res.writeHead(204, CORS_HEADERS);
+    res.end();
+    return;
+  }
+
+  try {
+    // Health check
+    if (url.pathname === "/health" && method === "GET") {
+      sendJson(res, { status: "ok", timestamp: Date.now() });
+      return;
     }
-  },
-  error(error) {
-    console.error("Bun server error:", error);
-    return new Response(JSON.stringify({ success: false, error: "Internal server error" }), {
-      status: 500,
-      headers: { "Content-Type": "application/json" },
-    });
-  },
-});
 
-console.log(`Scraper service running on port ${PORT}`);
+    // Read body for POST requests
+    let fetchReq: Request;
+    if (method === "POST") {
+      const body = await readBody(req);
+      fetchReq = toFetchRequest(req, body);
+    } else {
+      fetchReq = toFetchRequest(req, "");
+    }
+
+    // Extract landing page URL
+    if (url.pathname === "/api/extract" && method === "POST") {
+      const response = await handleExtract(fetchReq);
+      const responseBody = await response.text();
+      sendJson(res, JSON.parse(responseBody), response.status);
+      return;
+    }
+
+    // SEMrush domain overview
+    if (url.pathname === "/api/semrush/domain" && method === "POST") {
+      const response = await handleSemrushDomain(fetchReq);
+      const responseBody = await response.text();
+      sendJson(res, JSON.parse(responseBody), response.status);
+      return;
+    }
+
+    // SEMrush ad copies
+    if (url.pathname === "/api/semrush/ads" && method === "POST") {
+      const response = await handleSemrushAds(fetchReq);
+      const responseBody = await response.text();
+      sendJson(res, JSON.parse(responseBody), response.status);
+      return;
+    }
+
+    // 404
+    sendJson(res, { error: "Not found" }, 404);
+  } catch (err) {
+    console.error("Unhandled error in request handler:", err);
+    sendJson(res, {
+      success: false,
+      error: "Internal server error",
+      details: err instanceof Error ? err.message : String(err),
+    }, 500);
+  }
+}
+
+const server = createServer(handleRequest);
+
+server.listen(PORT, () => {
+  console.log(`Scraper service running on port ${PORT}`);
+});
 
 // Graceful shutdown
 process.on("SIGTERM", () => {
   console.log("Received SIGTERM, shutting down...");
-  server.stop();
-  process.exit(0);
+  server.close(() => process.exit(0));
 });
 
 process.on("SIGINT", () => {
   console.log("Received SIGINT, shutting down...");
-  server.stop();
-  process.exit(0);
+  server.close(() => process.exit(0));
 });
