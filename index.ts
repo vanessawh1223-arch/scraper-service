@@ -1,4 +1,4 @@
-import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
+import { chromium, type Browser, type BrowserContext, type Page, type Route } from "playwright";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -131,18 +131,90 @@ function formatNumber(str: string): number {
 }
 
 // ---------------------------------------------------------------------------
+// URL Comparison Helpers
+// ---------------------------------------------------------------------------
+
+// Compare URLs ignoring trailing slash and hash
+function isSameUrl(a: string, b: string): boolean {
+  try {
+    const urlA = new URL(a);
+    const urlB = new URL(b);
+    urlA.hash = "";
+    urlB.hash = "";
+    return urlA.href.replace(/\/+$/, "") === urlB.href.replace(/\/+$/, "");
+  } catch {
+    return a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
+  }
+}
+
+// Check if URL is a chrome error page
+function isChromeError(url: string): boolean {
+  return url.startsWith("chrome-error://") || url === "about:blank";
+}
+
+// ---------------------------------------------------------------------------
+// Route Bypass - Bypasses Chromium's SubresourceFilter blocking
+// ---------------------------------------------------------------------------
+
+async function setupRouteBypass(context: BrowserContext): Promise<void> {
+  await context.route("**/*", async (route: Route) => {
+    const request = route.request();
+
+    // Only intercept document (navigation) requests
+    // Non-navigation requests (images/scripts) won't be blocked by SubresourceFilter
+    if (request.resourceType() !== "document") {
+      await route.continue();
+      return;
+    }
+
+    try {
+      // route.fetch() uses Playwright's HTTP client, NOT Chromium's network stack
+      // This completely bypasses SubresourceFilter!
+      // maxRedirects: 0 makes browser follow redirects step by step
+      const response = await route.fetch({ maxRedirects: 0 });
+      const status = response.status();
+
+      if (status >= 300 && status < 400) {
+        // 3xx redirect: fulfill as redirect response
+        // Browser will automatically request the Location URL (which gets intercepted again)
+        const headers: Record<string, string> = {};
+        for (const [key, value] of Object.entries(response.headers())) {
+          if (["content-length", "content-encoding", "content-type"].includes(key.toLowerCase())) continue;
+          headers[key] = value;
+        }
+        await route.fulfill({ status, headers, body: "" });
+        return;
+      }
+
+      // Non-3xx: fulfill complete response (browser renders HTML, executes JS)
+      await route.fulfill({ response });
+    } catch {
+      // If route.fetch fails, fall back to route.continue()
+      try {
+        await route.continue();
+      } catch {}
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Playwright Browser Helpers
 // ---------------------------------------------------------------------------
 
 async function launchBrowser(proxy?: string): Promise<{ browser: Browser; context: BrowserContext }> {
   const launchOptions: Record<string, unknown> = {
     headless: true,
+    ignoreDefaultArgs: ["--enable-automation"],
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
       "--disable-gpu",
+      "--disable-blink-features=AutomationControlled",
+      "--disable-features=SubresourceFilter,SafeBrowsing,OptimizationGuideModelDownloading,OptimizationHints,OptimizationTargetPrediction,PrivacySandboxSettings4",
+      "--disable-web-security",
       "--disable-extensions",
+      "--no-first-run",
     ],
   };
 
@@ -154,9 +226,13 @@ async function launchBrowser(proxy?: string): Promise<{ browser: Browser; contex
   const browser = await chromium.launch(launchOptions);
   const context = await browser.newContext({
     userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     viewport: { width: 1920, height: 1080 },
     locale: "en-US",
+    timezoneId: "America/New_York",
+    ignoreHTTPSErrors: true,
+    bypassCSP: true,
+    extraHTTPHeaders: { "Accept-Language": "en-US,en;q=0.9" },
   });
 
   return { browser, context };
@@ -171,6 +247,175 @@ async function closeBrowser(browser: Browser): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// 5-Phase Extraction Strategy
+// ---------------------------------------------------------------------------
+
+async function extractOnce(
+  affiliateLink: string,
+  proxyUrl?: string
+): Promise<{ success: boolean; landingPageUrl: string | null; redirectChain: string[]; finalUrl: string | null }> {
+  const { browser, context } = await launchBrowser(proxyUrl);
+
+  // CRITICAL: Setup route bypass BEFORE creating page
+  await setupRouteBypass(context);
+
+  // Anti-detection initScript - must be before newPage()
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => false });
+    (window as any).chrome = { runtime: {}, app: {} };
+  });
+
+  const page = await context.newPage();
+  const redirectChain: string[] = [];
+  let previousUrl = affiliateLink;
+
+  // Track redirects via response events (only main frame document requests)
+  page.on("response", (response) => {
+    const url = response.url();
+    const request = response.request();
+    if (request.resourceType() !== "document") return;
+    if (request.frame() !== page.mainFrame()) return;
+    if (!isSameUrl(url, previousUrl)) {
+      redirectChain.push(url);
+      previousUrl = url;
+    }
+  });
+
+  let currentUrl: string;
+
+  try {
+    // Phase 1: Navigate to affiliate link, waitUntil: 'load'
+    // (not 'domcontentloaded' - we need JS to execute)
+    await page.goto(affiliateLink, { waitUntil: "load", timeout: 60000 });
+  } catch (navError) {
+    // Navigation may fail but the page might have still loaded enough
+    const errMsg = navError instanceof Error ? navError.message : String(navError);
+    console.warn("Phase 1 navigation warning:", errMsg);
+  }
+
+  currentUrl = page.url();
+
+  // If URL already changed, we might be done
+  if (!isSameUrl(currentUrl, affiliateLink) && !isChromeError(currentUrl)) {
+    const landingPageUrl = currentUrl;
+    await browser.close();
+    return {
+      success: !!landingPageUrl,
+      landingPageUrl,
+      redirectChain,
+      finalUrl: landingPageUrl,
+    };
+  }
+
+  // Phase 2: Wait for URL change (20 seconds) - handles JS delayed redirects
+  if (isSameUrl(currentUrl, affiliateLink) || isChromeError(currentUrl)) {
+    try {
+      await page.waitForURL(
+        (url) => {
+          const urlStr = url.toString();
+          return !isSameUrl(urlStr, affiliateLink) && !isChromeError(urlStr);
+        },
+        { timeout: 20000 }
+      );
+      currentUrl = page.url();
+    } catch {
+      // URL didn't change, might be on the same page
+    }
+  }
+
+  // Phase 3: Wait for network idle
+  try {
+    await page.waitForLoadState("networkidle", { timeout: 15000 });
+  } catch {}
+
+  currentUrl = page.url();
+
+  // Phase 4: Parse page content for redirect URLs
+  if (isSameUrl(currentUrl, affiliateLink) || isChromeError(currentUrl)) {
+    // Check for meta refresh
+    const metaRefreshUrl = await page.evaluate(() => {
+      const meta = document.querySelector('meta[http-equiv="refresh"]');
+      if (meta) {
+        const content = meta.getAttribute("content") || "";
+        const match = content.match(/url=(.+)/i);
+        return match ? match[1].trim() : null;
+      }
+      return null;
+    });
+
+    if (metaRefreshUrl) {
+      try {
+        await page.goto(metaRefreshUrl, { waitUntil: "load", timeout: 60000 });
+        currentUrl = page.url();
+      } catch (navError) {
+        console.warn("Phase 4 meta refresh navigation warning:", navError instanceof Error ? navError.message : String(navError));
+      }
+    }
+
+    // Check for JS redirects
+    if (isSameUrl(currentUrl, affiliateLink) || isChromeError(currentUrl)) {
+      const jsRedirectUrl = await page.evaluate(() => {
+        const scripts = document.querySelectorAll("script");
+        for (const script of scripts) {
+          const text = script.textContent || "";
+          const match = text.match(/(?:window\.)?location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/);
+          if (match) return match[1];
+          const match2 = text.match(/location\.replace\(['"]([^'"]+)['"]\)/);
+          if (match2) return match2[1];
+        }
+        return null;
+      });
+
+      if (jsRedirectUrl) {
+        try {
+          await page.goto(jsRedirectUrl, { waitUntil: "load", timeout: 60000 });
+          currentUrl = page.url();
+        } catch (navError) {
+          console.warn("Phase 4 JS redirect navigation warning:", navError instanceof Error ? navError.message : String(navError));
+        }
+      }
+    }
+
+    // Check for iframe redirects
+    if (isSameUrl(currentUrl, affiliateLink) || isChromeError(currentUrl)) {
+      const iframeUrl = await page.evaluate(() => {
+        const iframe = document.querySelector("iframe[src]");
+        return iframe ? iframe.getAttribute("src") : null;
+      });
+
+      if (iframeUrl && iframeUrl.startsWith("http")) {
+        try {
+          await page.goto(iframeUrl, { waitUntil: "load", timeout: 60000 });
+          currentUrl = page.url();
+        } catch (navError) {
+          console.warn("Phase 4 iframe redirect navigation warning:", navError instanceof Error ? navError.message : String(navError));
+        }
+      }
+    }
+  }
+
+  // Phase 5: Second navigation with networkidle as fallback
+  if (isSameUrl(currentUrl, affiliateLink) || isChromeError(currentUrl)) {
+    try {
+      await page.goto(affiliateLink, { waitUntil: "networkidle", timeout: 45000 });
+      currentUrl = page.url();
+    } catch {}
+  }
+
+  // Final URL
+  const landingPageUrl = isChromeError(currentUrl) || isSameUrl(currentUrl, affiliateLink) ? null : currentUrl;
+
+  await browser.close();
+
+  return {
+    success: !!landingPageUrl,
+    landingPageUrl,
+    redirectChain,
+    finalUrl: landingPageUrl,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Endpoint: POST /api/extract
 // ---------------------------------------------------------------------------
 
@@ -182,7 +427,7 @@ async function handleExtract(req: Request): Promise<Response> {
     return jsonResponse({ success: false, error: "Invalid JSON body" }, 400);
   }
 
-  const { url, proxy, timeout = 30000 } = body;
+  const { url, proxy } = body;
 
   if (!url) {
     return jsonResponse({ success: false, error: "URL is required" }, 400);
@@ -195,114 +440,16 @@ async function handleExtract(req: Request): Promise<Response> {
     return jsonResponse({ success: false, error: "Invalid URL format" }, 400);
   }
 
-  let browser: Browser | null = null;
-
   try {
-    const { browser: launchedBrowser, context } = await launchBrowser(proxy);
-    browser = launchedBrowser;
-
-    const page = await context.newPage();
-    const redirectChain: string[] = [url];
-    let landingPageUrl = url;
-
-    // Track redirects via response events
-    page.on("response", (response) => {
-      const responseUrl = response.url();
-      const status = response.status();
-      // 3xx redirects and navigations
-      if (
-        (status >= 300 && status < 400) ||
-        (responseUrl !== redirectChain[redirectChain.length - 1] && status < 400)
-      ) {
-        if (!redirectChain.includes(responseUrl)) {
-          redirectChain.push(responseUrl);
-        }
-      }
-    });
-
-    // Track URL changes via framenavigated
-    page.on("framenavigated", (frame) => {
-      const frameUrl = frame.url();
-      if (frame === page.mainFrame() && !redirectChain.includes(frameUrl)) {
-        redirectChain.push(frameUrl);
-      }
-    });
-
-    // Navigate to the URL
-    try {
-      await page.goto(url, {
-        waitUntil: "domcontentloaded",
-        timeout,
-      });
-    } catch (navError) {
-      const errMsg = navError instanceof Error ? navError.message : String(navError);
-      // If it's a timeout but we have some redirects, we can still return partial data
-      if (errMsg.includes("Timeout") && redirectChain.length > 1) {
-        const finalUrl = page.url();
-        if (finalUrl && finalUrl !== "about:blank" && !redirectChain.includes(finalUrl)) {
-          redirectChain.push(finalUrl);
-        }
-        landingPageUrl = finalUrl || redirectChain[redirectChain.length - 1];
-        await closeBrowser(browser);
-        return jsonResponse({
-          success: true,
-          landingPageUrl,
-          redirectChain,
-          finalUrl: landingPageUrl,
-          warning: "Page timed out but partial redirect chain was captured",
-        });
-      }
-      throw navError;
-    }
-
-    // Wait a moment for any additional client-side redirects
-    await page.waitForTimeout(2000);
-
-    // Get the current URL after any JS redirects
-    const currentUrl = page.url();
-    if (currentUrl && currentUrl !== "about:blank" && !redirectChain.includes(currentUrl)) {
-      redirectChain.push(currentUrl);
-    }
-
-    // Determine landing page: find URL with tracking params or use final URL
-    landingPageUrl = currentUrl;
-
-    // Check if any URL in the chain has tracking parameters
-    for (let i = redirectChain.length - 1; i >= 0; i--) {
-      if (hasTrackingParams(redirectChain[i])) {
-        landingPageUrl = redirectChain[i];
-        break;
-      }
-    }
-
-    // Wait up to 5 more seconds for additional redirects if we found tracking params
-    if (hasTrackingParams(landingPageUrl)) {
-      try {
-        const navigationPromise = page.waitForNavigation({ timeout: 5000 });
-        await navigationPromise;
-        const newerUrl = page.url();
-        if (newerUrl && newerUrl !== "about:blank" && newerUrl !== currentUrl) {
-          if (!redirectChain.includes(newerUrl)) {
-            redirectChain.push(newerUrl);
-          }
-          landingPageUrl = newerUrl;
-        }
-      } catch {
-        // No further navigation happened, that's fine
-      }
-    }
-
-    await closeBrowser(browser);
+    const result = await extractOnce(url, proxy);
 
     return jsonResponse({
-      success: true,
-      landingPageUrl,
-      redirectChain,
-      finalUrl: page.url() || landingPageUrl,
+      success: result.success,
+      landingPageUrl: result.landingPageUrl,
+      redirectChain: result.redirectChain,
+      finalUrl: result.finalUrl,
     });
   } catch (err) {
-    if (browser) await closeBrowser(browser);
-
     const errMsg = err instanceof Error ? err.message : String(err);
 
     if (errMsg.includes("proxy") || errMsg.includes("Proxy") || errMsg.includes("ERR_PROXY_CONNECTION_FAILED")) {
