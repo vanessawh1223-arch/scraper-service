@@ -5,8 +5,11 @@ WORKDIR /app
 # Copy package files
 COPY package.json ./
 
-# Install Node.js dependencies
-RUN npm install
+# Skip downloading browsers - they're already in the Docker image
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+
+# Install Node.js dependencies only (no browser download)
+RUN npm install --production
 
 # Copy source code
 COPY index.ts ./
