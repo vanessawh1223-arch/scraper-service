@@ -357,7 +357,6 @@ async function semrushLogin(
   await page.waitForTimeout(2000);
 
   // Try to find and fill the card number / username field
-  // The login form at gwt.tuanai.me may have various field names
   const usernameSelectors = [
     'input[name="card"]',
     'input[name="cardNumber"]',
@@ -534,7 +533,6 @@ async function handleSemrushDomain(req: Request): Promise<Response> {
       // Fallback: look for traffic numbers in the page
       if (organicTraffic === 0) {
         const pageContent = await page.content();
-        // Try to find traffic data in the page using regex
         const organicMatch = pageContent.match(/organic[^]*?([\d,.KMB]+)\s*(?:visits|traffic)/i);
         if (organicMatch) {
           organicTraffic = formatNumber(organicMatch[1]);
@@ -575,11 +573,6 @@ async function handleSemrushDomain(req: Request): Promise<Response> {
     // Navigate to organic research for top keywords
     const topKeywords: TopKeyword[] = [];
     try {
-      const organicResearchUrl = `https://www.semrush.com/analytics/organic/overview/?q=${encodeURIComponent(domain)}&db=${countryDb}`;
-      await page.goto(organicResearchUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-      await page.waitForTimeout(5000);
-
-      // Try to navigate to positions report
       const positionsUrl = `https://www.semrush.com/analytics/organic/positions/?q=${encodeURIComponent(domain)}&db=${countryDb}`;
       await page.goto(positionsUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
       await page.waitForTimeout(5000);
@@ -593,7 +586,7 @@ async function handleSemrushDomain(req: Request): Promise<Response> {
 
       // Extract keywords from the table
       const rows = await page.locator("table tbody tr, .table__row").all();
-      const keywordLimit = Math.min(rows.length, 20); // Check up to 20 rows to find 5 with position 1
+      const keywordLimit = Math.min(rows.length, 20);
 
       for (let i = 0; i < keywordLimit && topKeywords.length < 5; i++) {
         try {
@@ -642,7 +635,6 @@ async function handleSemrushDomain(req: Request): Promise<Response> {
         let rootPaidTraffic = 0;
 
         try {
-          // Extract root domain organic traffic
           const organicSelectors = [
             '[data-at="organic-traffic"] .traffic-value',
             '[data-at="overview-traffic"]',
@@ -662,7 +654,6 @@ async function handleSemrushDomain(req: Request): Promise<Response> {
             }
           }
 
-          // Extract root domain paid traffic
           const paidSelectors = [
             '[data-at="adwords-traffic"] .traffic-value',
             '[data-at="paid-traffic"]',
@@ -758,7 +749,7 @@ async function handleSemrushAds(req: Request): Promise<Response> {
   let browser: Browser | null = null;
 
   try {
-    const { browser: launchedBrowser, context } = await launchBrowser(); // No proxy for SEMrush
+    const { browser: launchedBrowser, context } = await launchBrowser();
     browser = launchedBrowser;
 
     // Login to SEMrush
@@ -793,13 +784,11 @@ async function handleSemrushAds(req: Request): Promise<Response> {
           const cells = await row.locator("td, .table__cell").all();
 
           if (cells.length >= 2) {
-            // First cell is typically the headline/title
             const titleText = (await cells[0].textContent())?.trim() || "";
             if (titleText && titles.length < 15) {
               titles.push({ text: titleText, source: "scraped" });
             }
 
-            // Second cell might be description
             if (cells.length >= 2 && descriptions.length < 4) {
               const descText = (await cells[1].textContent())?.trim() || "";
               if (descText && descText !== titleText) {
@@ -812,7 +801,7 @@ async function handleSemrushAds(req: Request): Promise<Response> {
         }
       }
 
-      // Strategy 2: If table approach didn't work, try specific SEMrush ad copy selectors
+      // Strategy 2: Specific SEMrush ad copy selectors
       if (titles.length === 0) {
         const adCopySelectors = [
           ".ad-copy__title",
@@ -860,27 +849,6 @@ async function handleSemrushAds(req: Request): Promise<Response> {
               }
             }
             if (descriptions.length > 0) break;
-          } catch {
-            continue;
-          }
-        }
-      }
-
-      // Strategy 3: Try to find ad text in page content using generic patterns
-      if (titles.length === 0) {
-        // Look for any element that might contain ad headlines
-        const potentialTitles = await page
-          .locator("div, span, p, h3, h4")
-          .filter({ hasText: new RegExp(`.{20,100}`) })
-          .all();
-
-        for (let i = 0; i < Math.min(potentialTitles.length, 50) && titles.length < 15; i++) {
-          try {
-            const text = (await potentialTitles[i].textContent())?.trim() || "";
-            // Filter for reasonable ad title length and not navigation/UI text
-            if (text.length >= 20 && text.length <= 200 && !text.includes("Cookie") && !text.includes("Sign up")) {
-              titles.push({ text, source: "scraped" });
-            }
           } catch {
             continue;
           }
