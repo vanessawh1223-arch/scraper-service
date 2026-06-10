@@ -487,6 +487,9 @@ async function handleExtract(req: Request): Promise<Response> {
 
 // ---------------------------------------------------------------------------
 // SEMrush Login Helper
+// Supports two types of login pages:
+// 1. Gateway/proxy pages (like gwt.tuanai.me) — JS auto-redirects, no input fields
+// 2. Traditional login forms — has username/password input fields
 // ---------------------------------------------------------------------------
 
 async function semrushLogin(
@@ -497,111 +500,206 @@ async function semrushLogin(
 ): Promise<Page> {
   const page = await context.newPage();
 
-  // Navigate to login URL
-  await page.goto(loginUrl, { waitUntil: "networkidle", timeout: 60000 });
+  // Navigate to login URL — use 'load' to ensure JS executes
+  try {
+    await page.goto(loginUrl, { waitUntil: "load", timeout: 60000 });
+  } catch (navError) {
+    // Navigation might timeout but page could still be loaded enough
+    console.warn("Login page navigation warning:", navError instanceof Error ? navError.message : String(navError));
+  }
 
-  // Wait for the page to fully load
+  // Wait for JS to execute (node selector pages need time to test nodes)
+  await page.waitForTimeout(3000);
+
+  // Check if we already got redirected to SEMrush (gateway auto-redirect)
+  let currentUrl = page.url();
+  if (isOnSemrush(currentUrl)) {
+    console.log("Already on SEMrush after initial navigation (auto-redirect)");
+    return page;
+  }
+
+  // Check if this page has input fields (traditional login form)
+  const hasVisibleInputs = await page.locator('input:not([type="hidden"])').count() > 0;
+
+  if (hasVisibleInputs) {
+    // ── Traditional Login Flow ──
+    console.log("Detected traditional login form, filling credentials...");
+
+    // Try to find and fill the card number / username field
+    const usernameSelectors = [
+      'input[name="card"]',
+      'input[name="cardNumber"]',
+      'input[name="username"]',
+      'input[name="email"]',
+      'input[type="text"]',
+      'input[placeholder*="card" i]',
+      'input[placeholder*="number" i]',
+      'input[placeholder*="account" i]',
+      'input:not([type="password"]):not([type="hidden"])',
+    ];
+
+    let filledUsername = false;
+    for (const selector of usernameSelectors) {
+      try {
+        const el = page.locator(selector).first();
+        if ((await el.count()) > 0 && (await el.isVisible())) {
+          await el.click();
+          await el.fill(cardNumber);
+          filledUsername = true;
+          break;
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    if (!filledUsername) {
+      throw new Error("Could not find username/card number input field on login page");
+    }
+
+    // Find and fill the password field
+    const passwordSelectors = [
+      'input[name="password"]',
+      'input[type="password"]',
+      'input[placeholder*="password" i]',
+    ];
+
+    let filledPassword = false;
+    for (const selector of passwordSelectors) {
+      try {
+        const el = page.locator(selector).first();
+        if ((await el.count()) > 0 && (await el.isVisible())) {
+          await el.click();
+          await el.fill(password);
+          filledPassword = true;
+          break;
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    if (!filledPassword) {
+      throw new Error("Could not find password input field on login page");
+    }
+
+    // Click login/submit button
+    const submitSelectors = [
+      'button[type="submit"]',
+      'input[type="submit"]',
+      'button:has-text("Log in")',
+      'button:has-text("Login")',
+      'button:has-text("Sign in")',
+      'button:has-text("Submit")',
+      "form button",
+    ];
+
+    let submitted = false;
+    for (const selector of submitSelectors) {
+      try {
+        const el = page.locator(selector).first();
+        if ((await el.count()) > 0 && (await el.isVisible())) {
+          await el.click();
+          submitted = true;
+          break;
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    if (!submitted) {
+      await page.keyboard.press("Enter");
+    }
+
+    // Wait for navigation after login
+    try {
+      await page.waitForURL(
+        (url) => isOnSemrush(url.toString()),
+        { timeout: 30000 }
+      );
+    } catch {
+      // Give extra time
+      await page.waitForTimeout(5000);
+    }
+  } else {
+    // ── Gateway/Proxy Page Flow ──
+    // Pages like gwt.tuanai.me auto-select nodes and redirect to SEMrush
+    // No input fields needed — just wait for the JS redirect
+    console.log("Detected gateway/proxy page (no input fields), waiting for auto-redirect...");
+
+    // Wait for the JS to complete node testing and redirect
+    // Gateway pages typically take 5-15 seconds to test nodes and redirect
+    try {
+      await page.waitForURL(
+        (url) => isOnSemrush(url.toString()),
+        { timeout: 45000 }
+      );
+      console.log("Gateway redirected to SEMrush successfully");
+    } catch {
+      // Maybe it redirected to a different URL on the same domain first
+      // Check if the URL changed at all
+      currentUrl = page.url();
+      console.log("Current URL after waiting:", currentUrl);
+
+      // If still on the gateway page, try waiting for a click on a node card
+      if (!isOnSemrush(currentUrl)) {
+        // Try clicking the first available node card
+        try {
+          const nodeCards = page.locator('.node-card, [class*="node"], a[href*="semrush"]');
+          if ((await nodeCards.count()) > 0) {
+            console.log("Found node cards, clicking first one...");
+            await nodeCards.first().click();
+            await page.waitForTimeout(5000);
+          }
+        } catch {
+          // No clickable nodes found
+        }
+
+        // Try waiting more for the redirect
+        currentUrl = page.url();
+        if (!isOnSemrush(currentUrl)) {
+          try {
+            await page.waitForURL(
+              (url) => isOnSemrush(url.toString()),
+              { timeout: 30000 }
+            );
+          } catch {
+            throw new Error(
+              `Gateway page did not redirect to SEMrush. Current URL: ${page.url()}`
+            );
+          }
+        }
+      }
+    }
+  }
+
+  // Final check: are we on SEMrush?
+  currentUrl = page.url();
+  if (!isOnSemrush(currentUrl)) {
+    throw new Error(
+      `Failed to reach SEMrush after login. Current URL: ${currentUrl}`
+    );
+  }
+
+  // Wait for SEMrush to fully load
+  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
   await page.waitForTimeout(2000);
 
-  // Try to find and fill the card number / username field
-  const usernameSelectors = [
-    'input[name="card"]',
-    'input[name="cardNumber"]',
-    'input[name="username"]',
-    'input[name="email"]',
-    'input[type="text"]',
-    'input[placeholder*="card" i]',
-    'input[placeholder*="number" i]',
-    'input[placeholder*="account" i]',
-    'input:not([type="password"]):not([type="hidden"])',
-  ];
-
-  let filledUsername = false;
-  for (const selector of usernameSelectors) {
-    try {
-      const el = page.locator(selector).first();
-      if ((await el.count()) > 0 && (await el.isVisible())) {
-        await el.click();
-        await el.fill(cardNumber);
-        filledUsername = true;
-        break;
-      }
-    } catch {
-      continue;
-    }
-  }
-
-  if (!filledUsername) {
-    throw new Error("Could not find username/card number input field on login page");
-  }
-
-  // Find and fill the password field
-  const passwordSelectors = [
-    'input[name="password"]',
-    'input[type="password"]',
-    'input[placeholder*="password" i]',
-  ];
-
-  let filledPassword = false;
-  for (const selector of passwordSelectors) {
-    try {
-      const el = page.locator(selector).first();
-      if ((await el.count()) > 0 && (await el.isVisible())) {
-        await el.click();
-        await el.fill(password);
-        filledPassword = true;
-        break;
-      }
-    } catch {
-      continue;
-    }
-  }
-
-  if (!filledPassword) {
-    throw new Error("Could not find password input field on login page");
-  }
-
-  // Click login/submit button
-  const submitSelectors = [
-    'button[type="submit"]',
-    'input[type="submit"]',
-    'button:has-text("Log in")',
-    'button:has-text("Login")',
-    'button:has-text("Sign in")',
-    'button:has-text("Submit")',
-    "form button",
-  ];
-
-  let submitted = false;
-  for (const selector of submitSelectors) {
-    try {
-      const el = page.locator(selector).first();
-      if ((await el.count()) > 0 && (await el.isVisible())) {
-        await el.click();
-        submitted = true;
-        break;
-      }
-    } catch {
-      continue;
-    }
-  }
-
-  if (!submitted) {
-    // Try pressing Enter
-    await page.keyboard.press("Enter");
-  }
-
-  // Wait for navigation after login
-  await page.waitForTimeout(5000);
-
-  // Check if we're now on SEMrush
-  const currentUrl = page.url();
-  if (!currentUrl.includes("semrush") && !currentUrl.includes("tu")) {
-    // Give it more time
-    await page.waitForTimeout(5000);
-  }
-
+  console.log("Successfully logged into SEMrush:", currentUrl);
   return page;
+}
+
+// Check if URL is on SEMrush (including through proxy/gateway domains)
+function isOnSemrush(url: string): boolean {
+  const lower = url.toLowerCase();
+  return (
+    lower.includes("semrush") ||
+    lower.includes("sem_rush") ||
+    // Some gateways use different domains but still serve SEMrush content
+    lower.includes("analytics/overview") ||
+    lower.includes("analytics/organic")
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -630,6 +728,13 @@ async function handleSemrushDomain(req: Request): Promise<Response> {
   try {
     const { browser: launchedBrowser, context } = await launchBrowser(); // No proxy for SEMrush
     browser = launchedBrowser;
+
+    // Setup route bypass and anti-detection for the context
+    await setupRouteBypass(context);
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => false });
+      (window as any).chrome = { runtime: {}, app: {} };
+    });
 
     // Login to SEMrush
     const page = await semrushLogin(context, loginUrl, cardNumber, password);
@@ -898,6 +1003,13 @@ async function handleSemrushAds(req: Request): Promise<Response> {
   try {
     const { browser: launchedBrowser, context } = await launchBrowser();
     browser = launchedBrowser;
+
+    // Setup route bypass and anti-detection for the context
+    await setupRouteBypass(context);
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => false });
+      (window as any).chrome = { runtime: {}, app: {} };
+    });
 
     // Login to SEMrush
     const page = await semrushLogin(context, loginUrl, cardNumber, password);
