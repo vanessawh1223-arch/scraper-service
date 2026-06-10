@@ -607,6 +607,67 @@ async function semrushLogin(
 async function extractOrganicTraffic(page: Page): Promise<number> {
   let organicTraffic = 0;
 
+  // Strategy 0: Comprehensive page.evaluate to find all metric values
+  try {
+    const pageInfo = await page.evaluate(() => {
+      const bodyText = document.body?.innerText || '';
+      const bodyHtml = document.body?.innerHTML?.substring(0, 5000) || '';
+
+      // Find all elements that look like traffic metrics
+      const allElements = document.querySelectorAll('*');
+      const metricCandidates: { tag: string; text: string; className: string }[] = [];
+
+      for (const el of allElements) {
+        const text = (el.textContent || '').trim();
+        const cls = el.className || '';
+        // Look for elements with traffic-related class names or data attributes
+        if (
+          cls.includes('traffic') || cls.includes('organic') || cls.includes('metric') ||
+          cls.includes('overview') || cls.includes('summary') ||
+          (el instanceof HTMLElement && el.dataset.at?.includes('traffic'))
+        ) {
+          metricCandidates.push({
+            tag: el.tagName,
+            text: text.substring(0, 200),
+            className: typeof cls === 'string' ? cls.substring(0, 100) : '',
+          });
+        }
+      }
+
+      // Also look for any number that looks like traffic (e.g. "489.1M", "15,234")
+      const numberPatterns = bodyText.match(/[\d,]+\.?\d*\s*[KMB]?/g) || [];
+
+      return {
+        title: document.title,
+        url: location.href,
+        bodyTextPreview: bodyText.substring(0, 1000),
+        metricCandidates: metricCandidates.slice(0, 20),
+        numberPatterns: numberPatterns.slice(0, 30),
+      };
+    });
+
+    logStep("OrganicTraffic", `Page evaluate: title="${pageInfo.title}", url=${pageInfo.url}`);
+    logStep("OrganicTraffic", `Body text (first 300): ${pageInfo.bodyTextPreview.substring(0, 300)}`);
+    logStep("OrganicTraffic", `Metric candidates: ${JSON.stringify(pageInfo.metricCandidates.slice(0, 5))}`);
+    logStep("OrganicTraffic", `Number patterns: ${JSON.stringify(pageInfo.numberPatterns.slice(0, 10))}`);
+
+    // Try to extract from metric candidates
+    for (const candidate of pageInfo.metricCandidates) {
+      if (candidate.text.includes('organic') || candidate.text.includes('自然')) {
+        const numMatch = candidate.text.match(/([\d,.]+\s*[KMB]?)/);
+        if (numMatch) {
+          const val = formatNumber(numMatch[1]);
+          if (val > 0) {
+            logStep("OrganicTraffic", `Found in metric candidate: ${numMatch[1]} → ${val}`);
+            return val;
+          }
+        }
+      }
+    }
+  } catch (e) {
+    logStep("OrganicTraffic", "Strategy 0 (page.evaluate) failed:", e instanceof Error ? e.message : String(e));
+  }
+
   // Strategy 1: Look for the "自然流量" (Organic Traffic) label in Chinese or English
   try {
     const organicLabel = page.locator('text=自然流量, text=Organic Traffic').first();
@@ -696,6 +757,22 @@ async function extractOrganicTraffic(page: Page): Promise<number> {
       organicTraffic = formatNumber(metrics[0].value);
       if (organicTraffic > 0) {
         logStep("OrganicTraffic", `Found by DOM evaluation: ${metrics[0].value} → ${organicTraffic}`);
+      }
+    }
+  } catch {}
+
+  // Strategy 5: Brute force - look for any large number in the page that could be traffic
+  try {
+    const bodyText = await page.locator('body').innerText().catch(() => "");
+    // Look for patterns like "489.1M" or "15,234,567" that are typical for traffic values
+    const bigNumberMatches = bodyText.match(/\b[\d,]+\.?\d*\s*[KMB]\b/g) || [];
+    // Find the largest K/M/B number that's likely traffic
+    for (const numStr of bigNumberMatches) {
+      const val = formatNumber(numStr);
+      // Traffic values for SEMrush are typically in thousands or more
+      if (val >= 1000 && val > organicTraffic) {
+        organicTraffic = val;
+        logStep("OrganicTraffic", `Found large number (brute force): ${numStr} → ${val}`);
       }
     }
   } catch {}
@@ -894,6 +971,15 @@ async function handleSemrushDomain(req: Request): Promise<Response> {
     if (!overviewOk) {
       throw new Error("Failed to load domain overview page (session may have expired)");
     }
+
+    // Debug: Log page content summary for extraction debugging
+    try {
+      const pageText = await page.locator('body').innerText().catch(() => "");
+      logStep("SemrushDomain", `Page text preview (first 500 chars): ${pageText.substring(0, 500)}`);
+      const pageTitle = await page.title().catch(() => "");
+      const pageUrl = page.url();
+      logStep("SemrushDomain", `Page title: "${pageTitle}", URL: ${pageUrl}`);
+    } catch {}
 
     // Step 3: Extract organic traffic
     logStep("SemrushDomain", "Step 3: Extracting organic traffic...");
