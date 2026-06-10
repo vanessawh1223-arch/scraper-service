@@ -183,15 +183,16 @@ async function launchBrowser(proxy?: string): Promise<{ browser: Browser; contex
   return { browser, context };
 }
 
-// For SEMrush - NO route bypass, uses single-process mode for stability
+// For SEMrush - NO route bypass, NO single-process (causes issues in Docker)
 async function launchSemrushBrowser(): Promise<{ browser: Browser; context: BrowserContext }> {
   const browser = await chromium.launch({
     headless: true,
     args: [
       "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
-      "--disable-gpu", "--single-process", "--disable-extensions",
+      "--disable-gpu", "--disable-extensions",
       "--disable-background-networking", "--no-first-run",
       "--disable-blink-features=AutomationControlled",
+      "--disable-features=SubresourceFilter,SafeBrowsing",
     ],
   });
 
@@ -485,8 +486,12 @@ async function semrushLogin(
   // ── Phase 3: Click "打开 Semrush" to open the SEMrush interface ──
   logStep("SEMrush-Login", "Phase 3: Clicking 打开 Semrush button...");
 
-  // Listen for new page opening
-  const newPagePromise = context.waitForEvent('page', { timeout: 15000 }).catch(() => null);
+  // Strategy: Try opening SEMrush via new tab first; if that fails, navigate in the same page
+  let semrushPage: Page | null = null;
+  let semrushBaseUrl = "";
+
+  // Approach A: Click button that opens a new tab
+  const newPagePromise = context.waitForEvent('page', { timeout: 20000 }).catch(() => null);
 
   try {
     const openBtn = gatewayPage.locator('text=打开 Semrush, text=打开 semrush, a:has-text("Semrush")').first();
@@ -508,21 +513,89 @@ async function semrushLogin(
     }
   }
 
-  const semrushPage = await newPagePromise;
-  if (!semrushPage) {
-    throw new Error("SEMrush page did not open after clicking launch button");
+  const newPage = await newPagePromise;
+  if (newPage) {
+    // Wait for the new page to load
+    await newPage.waitForLoadState("domcontentloaded", { timeout: 30000 }).catch(() => {});
+    await newPage.waitForTimeout(5000);
+
+    // Wait for URL to stabilize (the new tab might redirect several times)
+    let stableUrl = newPage.url();
+    for (let attempt = 0; attempt < 5; attempt++) {
+      await newPage.waitForTimeout(3000);
+      const currentUrl = newPage.url();
+      if (currentUrl === stableUrl && !isChromeError(currentUrl) && currentUrl !== "about:blank") {
+        break;
+      }
+      stableUrl = currentUrl;
+    }
+
+    logStep("SEMrush-Login", "New tab URL after stabilization:", stableUrl);
+
+    // Check if the URL looks like a SEMrush proxy page
+    const newPageHost = new URL(stableUrl).hostname;
+    if (newPageHost.includes("semrush") || newPageHost.includes("taobao-seo") || stableUrl.includes("/analytics/") || stableUrl.includes("/dashboard/")) {
+      semrushPage = newPage;
+      semrushBaseUrl = new URL(stableUrl).protocol + "//" + new URL(stableUrl).host;
+      logStep("SEMrush-Login", "Using new tab as SEMrush page, base URL:", semrushBaseUrl);
+    } else {
+      logStep("SEMrush-Login", "New tab URL doesn't look like SEMrush:", stableUrl);
+      await newPage.close().catch(() => {});
+    }
   }
 
-  await semrushPage.waitForLoadState("domcontentloaded", { timeout: 30000 }).catch(() => {});
-  await semrushPage.waitForTimeout(3000);
+  // Approach B: If new tab didn't work, try navigating in the same gateway page
+  if (!semrushPage) {
+    logStep("SEMrush-Login", "New tab approach failed, trying to navigate in same page...");
 
-  const semrushUrl = semrushPage.url();
-  const semrushBaseUrl = new URL(semrushUrl).protocol + "//" + new URL(semrushUrl).host;
-  logStep("SEMrush-Login", "SEMrush page opened, URL:", semrushUrl);
-  logStep("SEMrush-Login", "SEMrush base URL:", semrushBaseUrl);
+    // Look for SEMrush link on the dashboard
+    let semrushHref = "";
+    try {
+      const linkEl = gatewayPage.locator('a[href*="semrush"], a[href*="analytics"]').first();
+      if ((await linkEl.count()) > 0) {
+        semrushHref = await linkEl.getAttribute('href') || "";
+        logStep("SEMrush-Login", "Found SEMrush link href:", semrushHref);
+      }
+    } catch {}
 
-  // Close the gateway page (we don't need it anymore)
-  await gatewayPage.close().catch(() => {});
+    // Also try to find the link from the page HTML
+    if (!semrushHref) {
+      try {
+        const html = await gatewayPage.content();
+        const hrefMatch = html.match(/href=["']([^"']*semrush[^"']*)["']/i);
+        if (hrefMatch) {
+          semrushHref = hrefMatch[1];
+          logStep("SEMrush-Login", "Found SEMrush href in HTML:", semrushHref);
+        }
+      } catch {}
+    }
+
+    if (semrushHref) {
+      // Navigate the gateway page to the SEMrush URL
+      const fullUrl = semrushHref.startsWith("http") ? semrushHref : new URL(semrushHref, gatewayPage.url()).href;
+      logStep("SEMrush-Login", "Navigating gateway page to:", fullUrl);
+      await gatewayPage.goto(fullUrl, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
+      await gatewayPage.waitForTimeout(5000);
+    }
+
+    // Use the gateway page as the SEMrush page
+    semrushPage = gatewayPage;
+    const currentUrl = semrushPage.url();
+    semrushBaseUrl = new URL(currentUrl).protocol + "//" + new URL(currentUrl).host;
+    logStep("SEMrush-Login", "Using gateway page as SEMrush page, base URL:", semrushBaseUrl);
+  }
+
+  // Verify we have a valid SEMrush base URL
+  if (!semrushBaseUrl || semrushBaseUrl === "about:blank") {
+    throw new Error("Could not determine SEMrush base URL after login");
+  }
+
+  logStep("SEMrush-Login", "Final SEMrush base URL:", semrushBaseUrl);
+
+  // Close the gateway page only if we're using a different page
+  if (semrushPage !== gatewayPage) {
+    await gatewayPage.close().catch(() => {});
+  }
 
   return { page: semrushPage, semrushBaseUrl };
 }
@@ -741,28 +814,50 @@ async function navigateToSemrushPage(
   const url = `${baseUrl}${path}?q=${encodeURIComponent(domain)}&db=${countryDb}`;
   logStep("Navigate", `Navigating to: ${url}`);
 
-  try {
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
-    logStep("Navigate", "Page domcontentloaded, URL:", page.url());
+  // Retry logic: try up to 2 times
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      if (attempt > 1) {
+        logStep("Navigate", `Retry attempt ${attempt}...`);
+      }
+      await page.goto(url, { waitUntil: "load", timeout: 90000 });
+      logStep("Navigate", "Page loaded, URL:", page.url());
 
-    await page.waitForTimeout(8000);
-    try { await page.waitForLoadState("networkidle", { timeout: 15000 }); } catch {}
+      // Wait for the page to settle (proxy pages can be slow)
+      await page.waitForTimeout(10000);
+      try { await page.waitForLoadState("networkidle", { timeout: 20000 }); } catch {}
 
-    const pageTitle = await page.title();
-    logStep("Navigate", `Page title: "${pageTitle}"`);
+      const pageTitle = await page.title().catch(() => "");
+      logStep("Navigate", `Page title: "${pageTitle}"`);
 
-    // Check for login redirect (session expired)
-    const currentUrl = page.url();
-    if (pageTitle === "登录" || pageTitle === "Login" || currentUrl.includes("login")) {
-      logStep("Navigate", "WARNING: On login page - session may have expired");
-      return false;
+      // Check for login redirect (session expired)
+      const currentUrl = page.url();
+      if (pageTitle === "登录" || pageTitle === "Login" || currentUrl.includes("login")) {
+        logStep("Navigate", "WARNING: On login page - session may have expired");
+        return false;
+      }
+
+      // Check if page loaded with actual content (not a blank/error page)
+      const bodyText = await page.locator('body').textContent().catch(() => "");
+      if (bodyText && bodyText.trim().length > 50) {
+        logStep("Navigate", "Page has content, navigation successful");
+        return true;
+      }
+
+      logStep("Navigate", "Page appears empty, waiting more...");
+      await page.waitForTimeout(5000);
+      return true;  // Return true anyway, let extraction handle empty pages
+    } catch (err) {
+      logStep("Navigate", `Attempt ${attempt} failed:`, err instanceof Error ? err.message : String(err));
+      if (attempt === 2) {
+        return false;
+      }
+      // Wait before retrying
+      await page.waitForTimeout(3000);
     }
-
-    return true;
-  } catch (err) {
-    logStep("Navigate", "Navigation failed:", err instanceof Error ? err.message : String(err));
-    return false;
   }
+
+  return false;
 }
 
 // ---------------------------------------------------------------------------
