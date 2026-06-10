@@ -917,33 +917,128 @@ async function extractPaidTraffic(page: Page): Promise<number> {
   return paidTraffic;
 }
 
-async function extractTopKeywords(page: Page): Promise<TopKeyword[]> {
+async function extractTopKeywords(page: Page, maxPages: number = 10): Promise<TopKeyword[]> {
   const topKeywords: TopKeyword[] = [];
+  const MAX_KEYWORDS = 200; // Safety cap
 
   try {
     await page.waitForSelector("table, .table, [data-at='positions-table']", { timeout: 10000 });
   } catch {}
 
-  const rows = await page.locator("table tbody tr, .table__row").all();
-  const keywordLimit = Math.min(rows.length, 20);
+  for (let pageNum = 0; pageNum < maxPages; pageNum++) {
+    const rows = await page.locator("table tbody tr, .table__row").all();
+    let foundNonPosition1 = false;
+    let pageKeywordCount = 0;
 
-  for (let i = 0; i < keywordLimit && topKeywords.length < 5; i++) {
+    for (let i = 0; i < rows.length; i++) {
+      if (topKeywords.length >= MAX_KEYWORDS) break;
+      try {
+        const row = rows[i];
+        const cells = await row.locator("td, .table__cell").all();
+        if (cells.length >= 3) {
+          const keywordText = (await cells[0].textContent())?.trim() || "";
+          const positionText = (await cells[1].textContent())?.trim() || "";
+          const trafficText = (await cells[2].textContent())?.trim() || "";
+          const position = parseInt(positionText, 10);
+          if (position === 1 && keywordText) {
+            topKeywords.push({ keyword: keywordText, traffic: formatNumber(trafficText), position: 1 });
+            pageKeywordCount++;
+          } else if (position > 1) {
+            // If we encounter a non-position-1 keyword, note it
+            foundNonPosition1 = true;
+          }
+        }
+      } catch { continue; }
+    }
+
+    logStep("TopKeywords", `Page ${pageNum + 1}: found ${pageKeywordCount} position-1 keywords, total=${topKeywords.length}`);
+
+    // If we found non-position-1 keywords on this page, no need to paginate further
+    // (keywords are sorted by position ascending, so once we see position > 1, we're done)
+    if (foundNonPosition1 || topKeywords.length >= MAX_KEYWORDS) {
+      break;
+    }
+
+    // Try to click "next page" / pagination button
     try {
-      const row = rows[i];
-      const cells = await row.locator("td, .table__cell").all();
-      if (cells.length >= 3) {
-        const keywordText = (await cells[0].textContent())?.trim() || "";
-        const positionText = (await cells[1].textContent())?.trim() || "";
-        const trafficText = (await cells[2].textContent())?.trim() || "";
-        const position = parseInt(positionText, 10);
-        if (position === 1 && keywordText) {
-          topKeywords.push({ keyword: keywordText, traffic: formatNumber(trafficText), position: 1 });
+      const nextButton = page.locator("[data-at='pagination-next'], .pagination__next, button[aria-label='Next page'], a[rel='next'], .pager__item--next").first();
+      const isVisible = await nextButton.isVisible().catch(() => false);
+      if (!isVisible) {
+        logStep("TopKeywords", "No more pages available");
+        break;
+      }
+      await nextButton.click();
+      await page.waitForTimeout(2000); // Wait for new data to load
+      try {
+        await page.waitForSelector("table, .table, [data-at='positions-table']", { timeout: 8000 });
+      } catch {
+        logStep("TopKeywords", "Table not found after pagination, stopping");
+        break;
+      }
+    } catch {
+      logStep("TopKeywords", "Could not find or click next page button, stopping");
+      break;
+    }
+  }
+
+  logStep("TopKeywords", `Extracted ${topKeywords.length} position-1 keywords total`);
+  return topKeywords;
+}
+
+/**
+ * Try to extract top keywords from captured SEMrush API responses.
+ * SEMrush API typically returns keyword data with fields like:
+ *   Ph = keyword phrase, Po = position, Tr = traffic
+ * This is more reliable than DOM scraping when API responses are available.
+ */
+function extractKeywordsFromApiData(capturedApiData: { url: string; body: any }[]): TopKeyword[] {
+  const topKeywords: TopKeyword[] = [];
+  const MAX_KEYWORDS = 200;
+  const seenKeywords = new Set<string>();
+
+  for (const apiResponse of capturedApiData) {
+    try {
+      // Only look at responses that might contain position/keyword data
+      const url = apiResponse.url;
+      if (!url.includes('organic') && !url.includes('positions') && !url.includes('analytics')) continue;
+
+      const bodyStr = JSON.stringify(apiResponse.body);
+
+      // Try to find keyword data arrays in the API response
+      // SEMrush API format: data arrays with Ph (phrase), Po (position), Tr (traffic) fields
+      const dataMatch = bodyStr.match(/"data"\s*:\s*\[([\s\S]*?)\]/);
+      if (!dataMatch) continue;
+
+      // Parse individual entries looking for Ph/Po/Tr pattern
+      const entryPattern = /\{[^{}]*"Ph"\s*:\s*"([^"]+)"[^{}]*"Po"\s*:\s*(\d+)[^{}]*"Tr"\s*:\s*([\d,.]+)/g;
+      let match;
+      while ((match = entryPattern.exec(bodyStr)) !== null && topKeywords.length < MAX_KEYWORDS) {
+        const keyword = match[1];
+        const position = parseInt(match[2], 10);
+        const traffic = formatNumber(match[3]);
+        if (position === 1 && keyword && !seenKeywords.has(keyword.toLowerCase())) {
+          seenKeywords.add(keyword.toLowerCase());
+          topKeywords.push({ keyword, traffic, position: 1 });
+        }
+      }
+
+      // Alternative format: "Keyword"/"keyword"/"Ph" with different field names
+      const altPattern = /\{[^{}]*"(?:Ph|Keyword|keyword|keyword_phrase)"\s*:\s*"([^"]+)"[^{}]*"(?:Po|Position|position|pos)"\s*:\s*(\d+)[^{}]*"(?:Tr|Traffic|traffic|volume)"\s*:\s*([\d,.]+)/g;
+      while ((match = altPattern.exec(bodyStr)) !== null && topKeywords.length < MAX_KEYWORDS) {
+        const keyword = match[1];
+        const position = parseInt(match[2], 10);
+        const traffic = formatNumber(match[3]);
+        if (position === 1 && keyword && !seenKeywords.has(keyword.toLowerCase())) {
+          seenKeywords.add(keyword.toLowerCase());
+          topKeywords.push({ keyword, traffic, position: 1 });
         }
       }
     } catch { continue; }
   }
 
-  logStep("TopKeywords", `Extracted ${topKeywords.length} position-1 keywords`);
+  if (topKeywords.length > 0) {
+    logStep("TopKeywords-API", `Extracted ${topKeywords.length} position-1 keywords from API data`);
+  }
   return topKeywords;
 }
 
@@ -1126,13 +1221,41 @@ async function handleSemrushDomain(req: Request): Promise<Response> {
       logStep("SemrushDomain", `Paid traffic (API): ${paidTraffic}`);
     }
 
-    // Step 5: Navigate to organic positions for top keywords
+    // Step 5: Navigate to organic positions for top keywords (sorted by position ascending)
     logStep("SemrushDomain", "Step 5: Extracting top keywords...");
     let topKeywords: TopKeyword[] = [];
-    const positionsOk = await navigateToSemrushPage(page, semrushBaseUrl, "/analytics/organic/positions/", domain, countryDb);
+    // Navigate with sort by position ascending so position-1 keywords appear first
+    const positionsUrl = `${semrushBaseUrl}/analytics/organic/positions/?q=${encodeURIComponent(domain)}&db=${countryDb}&display_sort=pos_num&display_direction=asc`;
+    logStep("SemrushDomain", `Navigating to positions page with sort: ${positionsUrl}`);
+    let positionsOk = false;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await page.goto(positionsUrl, { waitUntil: "load", timeout: 90000 });
+        await page.waitForTimeout(10000);
+        try { await page.waitForLoadState("networkidle", { timeout: 20000 }); } catch {}
+        const pageTitle = await page.title().catch(() => "");
+        const currentUrl = page.url();
+        if (pageTitle === "登录" || pageTitle === "Login" || currentUrl.includes("login")) {
+          logStep("SemrushDomain", "WARNING: On login page during positions navigation - session expired");
+          break;
+        }
+        positionsOk = true;
+        break;
+      } catch (err) {
+        logStep("SemrushDomain", `Positions page attempt ${attempt} failed: ${err}`);
+      }
+    }
     if (positionsOk) {
       await page.waitForTimeout(3000);
-      topKeywords = await extractTopKeywords(page);
+      // Try API extraction first (more reliable)
+      topKeywords = extractKeywordsFromApiData(capturedApiData);
+      if (topKeywords.length > 0) {
+        logStep("SemrushDomain", `Got ${topKeywords.length} keywords from API data`);
+      } else {
+        // Fall back to DOM scraping with pagination support
+        logStep("SemrushDomain", "API extraction yielded no keywords, falling back to DOM scraping...");
+        topKeywords = await extractTopKeywords(page);
+      }
     } else {
       logStep("SemrushDomain", "Could not load positions page, skipping keyword extraction");
     }
