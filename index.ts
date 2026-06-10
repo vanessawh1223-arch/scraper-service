@@ -607,11 +607,44 @@ async function semrushLogin(
 async function extractOrganicTraffic(page: Page): Promise<number> {
   let organicTraffic = 0;
 
-  // Strategy 0: Comprehensive page.evaluate to find all metric values
+  // Strategy 0: Look for the Chinese proxy accessibility link text pattern
+  // Pattern: "自然流量是 117,697,336，前往自然搜索研究"
+  try {
+    const linkTexts = await page.evaluate(() => {
+      const results: string[] = [];
+      document.querySelectorAll('a, [role="link"]').forEach(el => {
+        const text = (el.textContent || '').trim();
+        if (text.includes('自然流量') || text.includes('organic traffic')) {
+          results.push(text);
+        }
+      });
+      // Also check aria-label attributes
+      document.querySelectorAll('[aria-label]').forEach(el => {
+        const label = el.getAttribute('aria-label') || '';
+        if (label.includes('自然流量') || label.includes('organic traffic')) {
+          results.push(label);
+        }
+      });
+      return results;
+    });
+
+    for (const text of linkTexts) {
+      // Match patterns like "自然流量是 117,697,336" or "自然流量 117,697,336"
+      const match = text.match(/自然流量(?:是)?\s*([\d,]+\.?\d*)/);
+      if (match) {
+        organicTraffic = formatNumber(match[1]);
+        if (organicTraffic > 0) {
+          logStep("OrganicTraffic", `Found by Chinese proxy link text: ${match[1]} → ${organicTraffic}`);
+          return organicTraffic;
+        }
+      }
+    }
+  } catch {}
+
+  // Strategy 1: Comprehensive page.evaluate to find all metric values
   try {
     const pageInfo = await page.evaluate(() => {
       const bodyText = document.body?.innerText || '';
-      const bodyHtml = document.body?.innerHTML?.substring(0, 5000) || '';
 
       // Find all elements that look like traffic metrics
       const allElements = document.querySelectorAll('*');
@@ -782,6 +815,38 @@ async function extractOrganicTraffic(page: Page): Promise<number> {
 
 async function extractPaidTraffic(page: Page): Promise<number> {
   let paidTraffic = 0;
+
+  // Strategy 0: Look for the Chinese proxy accessibility link text pattern
+  // Pattern: "付费流量是 2,745,681，前往广告研究"
+  try {
+    const linkTexts = await page.evaluate(() => {
+      const results: string[] = [];
+      document.querySelectorAll('a, [role="link"]').forEach(el => {
+        const text = (el.textContent || '').trim();
+        if (text.includes('付费流量') || text.includes('paid traffic')) {
+          results.push(text);
+        }
+      });
+      document.querySelectorAll('[aria-label]').forEach(el => {
+        const label = el.getAttribute('aria-label') || '';
+        if (label.includes('付费流量') || label.includes('paid traffic')) {
+          results.push(label);
+        }
+      });
+      return results;
+    });
+
+    for (const text of linkTexts) {
+      const match = text.match(/付费流量(?:是)?\s*([\d,]+\.?\d*)/);
+      if (match) {
+        paidTraffic = formatNumber(match[1]);
+        if (paidTraffic > 0) {
+          logStep("PaidTraffic", `Found by Chinese proxy link text: ${match[1]} → ${paidTraffic}`);
+          return paidTraffic;
+        }
+      }
+    }
+  } catch {}
 
   // Strategy 1: Look for "付费流量" (Paid Traffic) label
   try {
