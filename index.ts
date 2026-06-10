@@ -130,6 +130,12 @@ function formatNumber(str: string): number {
   return isNaN(num) ? 0 : num;
 }
 
+// Timestamp prefix for logs
+function logStep(step: string, ...args: unknown[]) {
+  const ts = new Date().toISOString().substr(11, 12);
+  console.log(`[${ts}] [${step}]`, ...args);
+}
+
 // ---------------------------------------------------------------------------
 // URL Comparison Helpers
 // ---------------------------------------------------------------------------
@@ -153,7 +159,8 @@ function isChromeError(url: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Route Bypass - Bypasses Chromium's SubresourceFilter blocking
+// Route Bypass - ONLY for extract endpoint, NOT for SEMrush
+// Bypasses Chromium's SubresourceFilter blocking
 // ---------------------------------------------------------------------------
 
 async function setupRouteBypass(context: BrowserContext): Promise<void> {
@@ -238,6 +245,20 @@ async function launchBrowser(proxy?: string): Promise<{ browser: Browser; contex
   return { browser, context };
 }
 
+// Launch a browser specifically for SEMrush — NO route bypass, just anti-detection
+async function launchSemrushBrowser(): Promise<{ browser: Browser; context: BrowserContext }> {
+  const { browser, context } = await launchBrowser();
+
+  // Anti-detection only — NO route bypass for SEMrush
+  // Route bypass breaks proxy authentication by intercepting cookies/sessions
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => false });
+    (window as any).chrome = { runtime: {}, app: {} };
+  });
+
+  return { browser, context };
+}
+
 async function closeBrowser(browser: Browser): Promise<void> {
   try {
     await browser.close();
@@ -247,7 +268,7 @@ async function closeBrowser(browser: Browser): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// 5-Phase Extraction Strategy
+// 5-Phase Extraction Strategy (for /api/extract only)
 // ---------------------------------------------------------------------------
 
 async function extractOnce(
@@ -256,7 +277,7 @@ async function extractOnce(
 ): Promise<{ success: boolean; landingPageUrl: string | null; redirectChain: string[]; finalUrl: string | null }> {
   const { browser, context } = await launchBrowser(proxyUrl);
 
-  // CRITICAL: Setup route bypass BEFORE creating page
+  // CRITICAL: Setup route bypass BEFORE creating page — only for extract!
   await setupRouteBypass(context);
 
   // Anti-detection initScript - must be before newPage()
@@ -490,6 +511,9 @@ async function handleExtract(req: Request): Promise<Response> {
 // Supports two types of login pages:
 // 1. Gateway/proxy pages (like gwt.tuanai.me) — JS auto-redirects, no input fields
 // 2. Traditional login forms — has username/password input fields
+//
+// IMPORTANT: This function must be used with a context that does NOT have
+// setupRouteBypass applied. Route bypass breaks proxy authentication.
 // ---------------------------------------------------------------------------
 
 async function semrushLogin(
@@ -497,33 +521,52 @@ async function semrushLogin(
   loginUrl: string,
   cardNumber: string,
   password: string
-): Promise<Page> {
+): Promise<{ page: Page; proxyBaseUrl: string | null }> {
+  logStep("SEMrush-Login", "Starting login flow, loginUrl:", loginUrl);
+
   const page = await context.newPage();
 
   // Navigate to login URL — use 'load' to ensure JS executes
   try {
+    logStep("SEMrush-Login", "Navigating to login URL...");
     await page.goto(loginUrl, { waitUntil: "load", timeout: 60000 });
+    logStep("SEMrush-Login", "Login page loaded, URL:", page.url());
   } catch (navError) {
     // Navigation might timeout but page could still be loaded enough
-    console.warn("Login page navigation warning:", navError instanceof Error ? navError.message : String(navError));
+    logStep("SEMrush-Login", "Navigation warning:", navError instanceof Error ? navError.message : String(navError));
   }
 
   // Wait for JS to execute (node selector pages need time to test nodes)
-  await page.waitForTimeout(3000);
+  await page.waitForTimeout(5000);
 
   // Check if we already got redirected to SEMrush (gateway auto-redirect)
   let currentUrl = page.url();
-  if (isOnSemrush(currentUrl)) {
-    console.log("Already on SEMrush after initial navigation (auto-redirect)");
-    return page;
+  logStep("SEmrush-Login", "Current URL after initial load:", currentUrl);
+
+  // Check if the URL has changed from the login URL (meaning we've been redirected)
+  const loginHost = new URL(loginUrl).hostname;
+  let currentHost: string;
+  try {
+    currentHost = new URL(currentUrl).hostname;
+  } catch {
+    currentHost = currentUrl;
+  }
+
+  if (currentHost !== loginHost && !isChromeError(currentUrl)) {
+    logStep("SEMrush-Login", "Already redirected after initial navigation to:", currentUrl);
+    // We've been redirected — likely to a proxy domain serving SEMrush
+    await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(2000);
+    return { page, proxyBaseUrl: extractProxyBaseUrl(currentUrl) };
   }
 
   // Check if this page has input fields (traditional login form)
   const hasVisibleInputs = await page.locator('input:not([type="hidden"])').count() > 0;
+  logStep("SEMrush-Login", "Has visible inputs:", hasVisibleInputs);
 
   if (hasVisibleInputs) {
     // ── Traditional Login Flow ──
-    console.log("Detected traditional login form, filling credentials...");
+    logStep("SEMrush-Login", "Detected traditional login form, filling credentials...");
 
     // Try to find and fill the card number / username field
     const usernameSelectors = [
@@ -546,6 +589,7 @@ async function semrushLogin(
           await el.click();
           await el.fill(cardNumber);
           filledUsername = true;
+          logStep("SEMrush-Login", "Filled username with selector:", selector);
           break;
         }
       } catch {
@@ -572,6 +616,7 @@ async function semrushLogin(
           await el.click();
           await el.fill(password);
           filledPassword = true;
+          logStep("SEMrush-Login", "Filled password with selector:", selector);
           break;
         }
       } catch {
@@ -601,6 +646,7 @@ async function semrushLogin(
         if ((await el.count()) > 0 && (await el.isVisible())) {
           await el.click();
           submitted = true;
+          logStep("SEMrush-Login", "Clicked submit with selector:", selector);
           break;
         }
       } catch {
@@ -609,113 +655,161 @@ async function semrushLogin(
     }
 
     if (!submitted) {
+      logStep("SEMrush-Login", "No submit button found, pressing Enter");
       await page.keyboard.press("Enter");
     }
 
-    // Wait for navigation after login
+    // Wait for navigation after login — check if URL changes from login page
     try {
       await page.waitForURL(
-        (url) => isOnSemrush(url.toString()),
+        (url) => {
+          try {
+            return new URL(url.toString()).hostname !== loginHost;
+          } catch {
+            return false;
+          }
+        },
         { timeout: 30000 }
       );
+      logStep("SEMrush-Login", "URL changed after login to:", page.url());
     } catch {
       // Give extra time
+      logStep("SEMrush-Login", "URL change timeout, waiting more...");
       await page.waitForTimeout(5000);
     }
   } else {
     // ── Gateway/Proxy Page Flow ──
     // Pages like gwt.tuanai.me auto-select nodes and redirect to SEMrush
     // No input fields needed — just wait for the JS redirect
-    console.log("Detected gateway/proxy page (no input fields), waiting for auto-redirect...");
+    logStep("SEMrush-Login", "Detected gateway/proxy page (no input fields), waiting for auto-redirect...");
 
-    // Get the original hostname to detect when redirect happens
-    const originalHost = new URL(loginUrl).hostname;
+    // Take a screenshot for debugging (only in development)
+    try {
+      const screenshot = await page.screenshot({ fullPage: true });
+      logStep("SEMrush-Login", `Gateway page screenshot size: ${screenshot.length} bytes`);
+    } catch {}
+
+    // Log the page content for debugging
+    try {
+      const bodyText = await page.evaluate(() => document.body?.innerText?.substring(0, 500) || "empty");
+      logStep("SEMrush-Login", "Gateway page text:", bodyText);
+    } catch {}
 
     // Wait for the JS to complete node testing and redirect
-    // Gateway pages redirect to a proxy domain that serves SEMrush content
-    // The proxy domain changes every time, so we just check if URL left the original domain
-    try {
-      await page.waitForURL(
-        (url) => {
-          const urlStr = url.toString();
-          try {
-            const urlObj = new URL(urlStr);
-            // Redirect happened if we're on a different domain
-            return urlObj.hostname !== originalHost && !isChromeError(urlStr);
-          } catch {
-            return false;
-          }
-        },
-        { timeout: 60000 }
-      );
-      currentUrl = page.url();
-      console.log("Gateway redirected to:", currentUrl);
-    } catch {
-      // Maybe the redirect happened before we started listening
-      currentUrl = page.url();
-      console.log("Current URL after timeout:", currentUrl);
+    // Strategy: Poll the URL every few seconds to detect domain change
+    const maxWaitMs = 90000; // 90 seconds total for gateway redirect
+    const pollIntervalMs = 3000;
+    const startTime = Date.now();
+    let redirected = false;
 
-      // If still on the gateway page, try clicking a node card
-      if (new URL(currentUrl).hostname === originalHost) {
-        try {
-          const nodeCards = page.locator('.node-card, [class*="node"], a[href]');
-          if ((await nodeCards.count()) > 0) {
-            console.log("Found node cards, clicking first one...");
-            await nodeCards.first().click();
-            await page.waitForTimeout(10000);
-          }
-        } catch {
-          // No clickable nodes found
-        }
+    while (Date.now() - startTime < maxWaitMs) {
+      currentUrl = page.url();
+      try {
+        currentHost = new URL(currentUrl).hostname;
+      } catch {
+        currentHost = currentUrl;
       }
 
+      if (currentHost !== loginHost && !isChromeError(currentUrl)) {
+        logStep("SEMrush-Login", "Gateway redirected to:", currentUrl);
+        redirected = true;
+        break;
+      }
+
+      // Also check if the page has navigated away (some redirects are pushState)
+      try {
+        const currentHref = await page.evaluate(() => window.location.href);
+        if (currentHref !== currentUrl) {
+          logStep("SEMrush-Login", "Detected pushState navigation to:", currentHref);
+          currentUrl = currentHref;
+          try {
+            currentHost = new URL(currentHref).hostname;
+          } catch {
+            currentHost = currentHref;
+          }
+          if (currentHost !== loginHost) {
+            redirected = true;
+            break;
+          }
+        }
+      } catch {}
+
+      // Check for auto-clicking opportunities (node selection buttons)
+      try {
+        const clickableNodes = page.locator('.node-card, [class*="node"], a[href*="http"], button:has-text("Go"), button:has-text("Enter"), button:has-text("Connect")');
+        if ((await clickableNodes.count()) > 0) {
+          logStep("SEMrush-Login", "Found clickable nodes, clicking first...");
+          await clickableNodes.first().click();
+          await page.waitForTimeout(5000);
+        }
+      } catch {}
+
+      await page.waitForTimeout(pollIntervalMs);
+    }
+
+    if (!redirected) {
+      // Final check
       currentUrl = page.url();
-      if (new URL(currentUrl).hostname === originalHost) {
+      try {
+        currentHost = new URL(currentUrl).hostname;
+      } catch {
+        currentHost = currentUrl;
+      }
+
+      if (currentHost === loginHost) {
+        // Try to get more diagnostic info
+        const pageTitle = await page.title().catch(() => "unknown");
+        const bodySnippet = await page.evaluate(() => document.body?.innerText?.substring(0, 200) || "empty").catch(() => "error");
         throw new Error(
-          `Gateway page did not redirect. Current URL: ${currentUrl}`
+          `Gateway page did not redirect within ${maxWaitMs / 1000}s. Title: "${pageTitle}", URL: ${currentUrl}, Body: ${bodySnippet}`
         );
       }
     }
 
     // We've left the gateway — we're on a SEMrush proxy
-    // Wait for the page to fully load
-    await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+    logStep("SEMrush-Login", "Gateway redirect successful, waiting for page to settle...");
+    await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(() => {});
     await page.waitForTimeout(3000);
   }
 
-  // Final: we should be on either SEMrush or a proxy that serves SEMrush
+  // Final: verify we're on a SEMrush-like page
   currentUrl = page.url();
-  console.log("Final URL after login:", currentUrl);
+  logStep("SEMrush-Login", "Final URL after login:", currentUrl);
 
   // Wait for the page to be interactive
   await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
   await page.waitForTimeout(2000);
 
-  return page;
+  // Verify the page has SEMrush-like content
+  const isSemrushLike = await isPageSemrushLike(page);
+  logStep("SEMrush-Login", "Page is SEMrush-like:", isSemrushLike);
+
+  return { page, proxyBaseUrl: extractProxyBaseUrl(currentUrl) };
 }
 
-// Check if URL is on SEMrush (including through proxy/gateway domains)
-function isOnSemrush(url: string): boolean {
-  const lower = url.toLowerCase();
-  return (
-    lower.includes("semrush") ||
-    lower.includes("sem_rush") ||
-    // Common proxy/gateway domains that serve SEMrush content
-    lower.includes("taobao-seo") ||
-    lower.includes("seo-") ||
-    // Some gateways use different domains but still serve SEMrush content
-    lower.includes("analytics/overview") ||
-    lower.includes("analytics/organic")
-  );
+// Extract the base URL from a proxy page URL
+// e.g., https://seo-abc.example.com/dashboard → https://seo-abc.example.com
+function extractProxyBaseUrl(url: string): string | null {
+  try {
+    const urlObj = new URL(url);
+    // If on semrush.com, no proxy base needed
+    if (urlObj.hostname.includes("semrush.com")) {
+      return null;
+    }
+    // Otherwise, return the protocol + host as the base URL
+    return `${urlObj.protocol}//${urlObj.host}`;
+  } catch {
+    return null;
+  }
 }
 
-// Check if a page has SEMrush-like content (for proxy pages)
+// Check if a page has SEMrush-like content
 async function isPageSemrushLike(page: Page): Promise<boolean> {
   try {
     const title = await page.title();
     const lowerTitle = title.toLowerCase();
     if (lowerTitle.includes("semrush")) return true;
-    
+
     // Check for SEMrush-specific elements in the page
     const hasSemrushElements = await page.evaluate(() => {
       const html = document.documentElement.innerHTML.toLowerCase();
@@ -723,6 +817,252 @@ async function isPageSemrushLike(page: Page): Promise<boolean> {
     });
     return hasSemrushElements;
   } catch {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SEMrush Data Extraction Helpers
+// ---------------------------------------------------------------------------
+
+async function extractOrganicTraffic(page: Page): Promise<number> {
+  let organicTraffic = 0;
+
+  // Strategy 1: Try SEMrush data-at selectors
+  const organicSelectors = [
+    '[data-at="organic-traffic"] .traffic-value',
+    '[data-at="overview-traffic"]',
+    '.overview-organic .traffic-value',
+    '[data-at="organic-traffic"]',
+  ];
+
+  for (const selector of organicSelectors) {
+    try {
+      const el = page.locator(selector).first();
+      if ((await el.count()) > 0) {
+        const text = await el.textContent();
+        if (text && text.trim()) {
+          organicTraffic = formatNumber(text);
+          if (organicTraffic > 0) {
+            logStep("OrganicTraffic", `Found with selector ${selector}: ${text.trim()} → ${organicTraffic}`);
+            return organicTraffic;
+          }
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  // Strategy 2: Find by text content "Organic Traffic"
+  try {
+    const organicLabel = page.locator('text=Organic Traffic').first();
+    if ((await organicLabel.count()) > 0) {
+      // Walk up to find the nearest number
+      const parent = organicLabel.locator('..');
+      const numberText = await parent.textContent();
+      if (numberText) {
+        const numMatch = numberText.match(/([\d,.KMB]+)\s*(?:visits|traffic)?/i);
+        if (numMatch) {
+          organicTraffic = formatNumber(numMatch[1]);
+          if (organicTraffic > 0) {
+            logStep("OrganicTraffic", `Found by text label: ${numMatch[1]} → ${organicTraffic}`);
+            return organicTraffic;
+          }
+        }
+      }
+    }
+  } catch {}
+
+  // Strategy 3: Regex from page HTML content
+  try {
+    const pageContent = await page.content();
+    const organicPatterns = [
+      /organic\s*(?:search\s*)?traffic[^]*?([\d,.]+\s*[KMB]?)/i,
+      /([\d,.]+\s*[KMB]?)\s*(?:organic\s*)?(?:visits|traffic)/i,
+    ];
+    for (const pattern of organicPatterns) {
+      const match = pageContent.match(pattern);
+      if (match) {
+        organicTraffic = formatNumber(match[1]);
+        if (organicTraffic > 0) {
+          logStep("OrganicTraffic", `Found by regex: ${match[1]} → ${organicTraffic}`);
+          return organicTraffic;
+        }
+      }
+    }
+  } catch {}
+
+  // Strategy 4: DOM evaluation for metric cards
+  try {
+    const metrics = await page.evaluate(() => {
+      const results: { label: string; value: string }[] = [];
+      const cards = document.querySelectorAll('[class*="metric"], [class*="card"], [class*="summary"], [class*="overview"]');
+      cards.forEach(card => {
+        const text = card.textContent || '';
+        if (text.toLowerCase().includes('organic') || text.toLowerCase().includes('traffic')) {
+          const numbers = text.match(/[\d,.]+\s*[KMB]?/g);
+          if (numbers && numbers.length > 0) {
+            results.push({ label: text.substring(0, 50), value: numbers[0] });
+          }
+        }
+      });
+      return results;
+    });
+
+    if (metrics.length > 0) {
+      organicTraffic = formatNumber(metrics[0].value);
+      if (organicTraffic > 0) {
+        logStep("OrganicTraffic", `Found by DOM evaluation: ${metrics[0].value} → ${organicTraffic}`);
+      }
+    }
+  } catch {}
+
+  return organicTraffic;
+}
+
+async function extractPaidTraffic(page: Page): Promise<number> {
+  let paidTraffic = 0;
+
+  // Strategy 1: SEMrush data-at selectors
+  const paidSelectors = [
+    '[data-at="adwords-traffic"] .traffic-value',
+    '[data-at="paid-traffic"]',
+    '.overview-paid .traffic-value',
+    '[data-at="paid-traffic"]',
+  ];
+
+  for (const selector of paidSelectors) {
+    try {
+      const el = page.locator(selector).first();
+      if ((await el.count()) > 0) {
+        const text = await el.textContent();
+        if (text && text.trim()) {
+          paidTraffic = formatNumber(text);
+          if (paidTraffic > 0) {
+            logStep("PaidTraffic", `Found with selector ${selector}: ${text.trim()} → ${paidTraffic}`);
+            return paidTraffic;
+          }
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  // Strategy 2: Find by text "Paid Traffic"
+  try {
+    const paidLabel = page.locator('text=Paid Traffic').first();
+    if ((await paidLabel.count()) > 0) {
+      const parent = paidLabel.locator('..');
+      const numberText = await parent.textContent();
+      if (numberText) {
+        const numMatch = numberText.match(/([\d,.KMB]+)/i);
+        if (numMatch) {
+          paidTraffic = formatNumber(numMatch[1]);
+          if (paidTraffic > 0) {
+            logStep("PaidTraffic", `Found by text label: ${numMatch[1]} → ${paidTraffic}`);
+            return paidTraffic;
+          }
+        }
+      }
+    }
+  } catch {}
+
+  // Strategy 3: Regex from page content
+  try {
+    const pageContent = await page.content();
+    const paidMatch = pageContent.match(/paid\s*(?:traffic|search)[^]*?([\d,.]+\s*[KMB]?)/i);
+    if (paidMatch) {
+      paidTraffic = formatNumber(paidMatch[1]);
+      if (paidTraffic > 0) {
+        logStep("PaidTraffic", `Found by regex: ${paidMatch[1]} → ${paidTraffic}`);
+      }
+    }
+  } catch {}
+
+  return paidTraffic;
+}
+
+async function extractTopKeywords(page: Page): Promise<TopKeyword[]> {
+  const topKeywords: TopKeyword[] = [];
+
+  // Try to wait for the table
+  try {
+    await page.waitForSelector("table, .table, [data-at='positions-table']", { timeout: 10000 });
+  } catch {
+    // Table may have different selector
+  }
+
+  // Extract keywords from the table
+  const rows = await page.locator("table tbody tr, .table__row").all();
+  const keywordLimit = Math.min(rows.length, 20);
+
+  for (let i = 0; i < keywordLimit && topKeywords.length < 5; i++) {
+    try {
+      const row = rows[i];
+      const cells = await row.locator("td, .table__cell").all();
+
+      if (cells.length >= 3) {
+        const keywordText = (await cells[0].textContent())?.trim() || "";
+        const positionText = (await cells[1].textContent())?.trim() || "";
+        const trafficText = (await cells[2].textContent())?.trim() || "";
+
+        const position = parseInt(positionText, 10);
+
+        if (position === 1 && keywordText) {
+          topKeywords.push({
+            keyword: keywordText,
+            traffic: formatNumber(trafficText),
+            position: 1,
+          });
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  logStep("TopKeywords", `Extracted ${topKeywords.length} position-1 keywords`);
+  return topKeywords;
+}
+
+// Navigate to a SEMrush page with robust error handling
+async function navigateToSemrushPage(
+  page: Page,
+  baseUrl: string,
+  path: string,
+  domain: string,
+  countryDb: string
+): Promise<boolean> {
+  const url = `${baseUrl}${path}?q=${encodeURIComponent(domain)}&db=${countryDb}`;
+  logStep("Navigate", `Navigating to: ${url}`);
+
+  try {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+    logStep("Navigate", "Page domcontentloaded, URL:", page.url());
+
+    // Wait for the page to fully render
+    await page.waitForTimeout(5000);
+
+    // Wait for content to appear (with timeout)
+    try {
+      await page.waitForLoadState("networkidle", { timeout: 15000 });
+    } catch {}
+
+    const pageTitle = await page.title();
+    logStep("Navigate", `Page title: "${pageTitle}"`);
+
+    // Check if we got redirected to a login page (session expired)
+    const currentUrl = page.url();
+    if (currentUrl.includes("login") || currentUrl.includes("signin")) {
+      logStep("Navigate", "WARNING: Redirected to login page - session may have expired");
+      return false;
+    }
+
+    return true;
+  } catch (err) {
+    logStep("Navigate", "Navigation failed:", err instanceof Error ? err.message : String(err));
     return false;
   }
 }
@@ -748,250 +1088,72 @@ async function handleSemrushDomain(req: Request): Promise<Response> {
     );
   }
 
+  logStep("SemrushDomain", `Starting domain query: ${domain} (${country})`);
+
   let browser: Browser | null = null;
 
   try {
-    const { browser: launchedBrowser, context } = await launchBrowser(); // No proxy for SEMrush
+    // Use SEMrush-specific browser launch (NO route bypass!)
+    const { browser: launchedBrowser, context } = await launchSemrushBrowser();
     browser = launchedBrowser;
 
-    // Setup route bypass and anti-detection for the context
-    await setupRouteBypass(context);
-    await context.addInitScript(() => {
-      Object.defineProperty(navigator, "webdriver", { get: () => false });
-      (window as any).chrome = { runtime: {}, app: {} };
-    });
-
-    // Login to SEMrush
-    const page = await semrushLogin(context, loginUrl, cardNumber, password);
+    // Step 1: Login to SEMrush
+    logStep("SemrushDomain", "Step 1: Logging in to SEMrush...");
+    const { page, proxyBaseUrl } = await semrushLogin(context, loginUrl, cardNumber, password);
 
     // Determine the base URL for SEMrush navigation
-    // If we're on a proxy domain, navigate SEMrush pages through that domain
-    const currentUrl = page.url();
-    let semrushBaseUrl: string;
-    if (currentUrl.includes("semrush.com")) {
-      semrushBaseUrl = "https://www.semrush.com";
-    } else {
-      // We're on a proxy domain — construct URL relative to it
-      const proxyUrl = new URL(currentUrl);
-      semrushBaseUrl = `${proxyUrl.protocol}//${proxyUrl.host}`;
-      console.log(`Using proxy base URL: ${semrushBaseUrl}`);
-    }
+    const semrushBaseUrl = proxyBaseUrl || "https://www.semrush.com";
+    logStep("SemrushDomain", `Using base URL: ${semrushBaseUrl}`);
 
-    // Navigate to domain overview
     const countryDb = country.toUpperCase();
-    const semrushDomainUrl = `${semrushBaseUrl}/analytics/overview/?q=${encodeURIComponent(domain)}&db=${countryDb}`;
 
-    await page.goto(semrushDomainUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+    // Step 2: Navigate to domain overview
+    logStep("SemrushDomain", "Step 2: Navigating to domain overview...");
+    const overviewOk = await navigateToSemrushPage(
+      page, semrushBaseUrl, "/analytics/overview/", domain, countryDb
+    );
 
-    // Wait for data to load — proxy pages may need more time
-    await page.waitForTimeout(5000);
-    
-    // Debug: log page title to understand what loaded
-    const pageTitle = await page.title();
-    console.log(`Page title: ${pageTitle}`);
-    
-    // Wait for the overview metrics to appear
+    if (!overviewOk) {
+      throw new Error("Failed to load domain overview page (session may have expired or page redirected to login)");
+    }
+
+    // Wait for overview metrics to appear
     try {
-      await page.waitForSelector('[data-at="overview-traffic"], .overview-metric, .traffic-value, [class*="traffic"], [class*="overview"]', {
-        timeout: 15000,
-      });
+      await page.waitForSelector(
+        '[data-at="overview-traffic"], .overview-metric, .traffic-value, [class*="traffic"], [class*="overview"], [class*="metric"]',
+        { timeout: 15000 }
+      );
+      logStep("SemrushDomain", "Overview metrics found on page");
     } catch {
-      // Try waiting more for proxy pages
-      console.log("First selector wait failed, waiting more...");
+      logStep("SemrushDomain", "Overview selector wait timed out, proceeding with extraction...");
       await page.waitForTimeout(5000);
     }
 
-    // Extract organic traffic using multiple strategies
-    let organicTraffic = 0;
-    try {
-      // Strategy 1: Try SEMrush data-at selectors
-      const organicSelectors = [
-        '[data-at="organic-traffic"] .traffic-value',
-        '[data-at="overview-traffic"]',
-        '.overview-organic .traffic-value',
-        '[data-at="organic-traffic"]',
-      ];
+    // Step 3: Extract organic traffic
+    logStep("SemrushDomain", "Step 3: Extracting organic traffic...");
+    const organicTraffic = await extractOrganicTraffic(page);
+    logStep("SemrushDomain", `Organic traffic: ${organicTraffic}`);
 
-      for (const selector of organicSelectors) {
-        try {
-          const el = page.locator(selector).first();
-          if ((await el.count()) > 0) {
-            const text = await el.textContent();
-            if (text && text.trim()) {
-              organicTraffic = formatNumber(text);
-              if (organicTraffic > 0) break;
-            }
-          }
-        } catch {
-          continue;
-        }
-      }
+    // Step 4: Extract paid traffic
+    logStep("SemrushDomain", "Step 4: Extracting paid traffic...");
+    const paidTraffic = await extractPaidTraffic(page);
+    logStep("SemrushDomain", `Paid traffic: ${paidTraffic}`);
 
-      // Strategy 2: Find by text content
-      if (organicTraffic === 0) {
-        try {
-          const organicLabel = page.locator('text=Organic Traffic').first();
-          if ((await organicLabel.count()) > 0) {
-            // Find the nearest number after "Organic Traffic" label
-            const parent = organicLabel.locator('..');
-            const numberText = await parent.textContent();
-            if (numberText) {
-              const numMatch = numberText.match(/([\d,.KMB]+)\s*(?:visits|traffic)?/i);
-              if (numMatch) {
-                organicTraffic = formatNumber(numMatch[1]);
-              }
-            }
-          }
-        } catch {}
-      }
+    // Step 5: Navigate to organic positions for top keywords
+    logStep("SemrushDomain", "Step 5: Extracting top keywords...");
+    let topKeywords: TopKeyword[] = [];
+    const positionsOk = await navigateToSemrushPage(
+      page, semrushBaseUrl, "/analytics/organic/positions/", domain, countryDb
+    );
 
-      // Strategy 3: Look for the main traffic number in the page
-      if (organicTraffic === 0) {
-        const pageContent = await page.content();
-        // Look for patterns like "15.2M" or "1,234" near "organic" or "traffic"
-        const organicPatterns = [
-          /organic\s*(?:search\s*)?traffic[^]*?([\d,.]+\s*[KMB]?)/i,
-          /([\d,.]+\s*[KMB]?)\s*(?:organic\s*)?(?:visits|traffic)/i,
-          /traffic[^]*?([\d,.]+\s*[KMB]?)/i,
-        ];
-        for (const pattern of organicPatterns) {
-          const match = pageContent.match(pattern);
-          if (match) {
-            organicTraffic = formatNumber(match[1]);
-            if (organicTraffic > 0) break;
-          }
-        }
-      }
-
-      // Strategy 4: Get all visible numbers from metric cards
-      if (organicTraffic === 0) {
-        try {
-          const metrics = await page.evaluate(() => {
-            const results: { label: string; value: string }[] = [];
-            // Look for metric cards/sections
-            const cards = document.querySelectorAll('[class*="metric"], [class*="card"], [class*="summary"]');
-            cards.forEach(card => {
-              const text = card.textContent || '';
-              if (text.toLowerCase().includes('organic') || text.toLowerCase().includes('traffic')) {
-                const numbers = text.match(/[\d,.]+\s*[KMB]?/g);
-                if (numbers && numbers.length > 0) {
-                  results.push({ label: text.substring(0, 50), value: numbers[0] });
-                }
-              }
-            });
-            return results;
-          });
-          
-          if (metrics.length > 0) {
-            organicTraffic = formatNumber(metrics[0].value);
-          }
-        } catch {}
-      }
-    } catch (err) {
-      console.error("Error extracting organic traffic:", err);
+    if (positionsOk) {
+      await page.waitForTimeout(3000);
+      topKeywords = await extractTopKeywords(page);
+    } else {
+      logStep("SemrushDomain", "Could not load positions page, skipping keyword extraction");
     }
 
-    // Extract paid traffic
-    let paidTraffic = 0;
-    try {
-      const paidSelectors = [
-        '[data-at="adwords-traffic"] .traffic-value',
-        '[data-at="paid-traffic"]',
-        '.overview-paid .traffic-value',
-        '[data-at="paid-traffic"]',
-      ];
-
-      for (const selector of paidSelectors) {
-        try {
-          const el = page.locator(selector).first();
-          if ((await el.count()) > 0) {
-            const text = await el.textContent();
-            if (text && text.trim()) {
-              paidTraffic = formatNumber(text);
-              if (paidTraffic > 0) break;
-            }
-          }
-        } catch {
-          continue;
-        }
-      }
-
-      // Strategy 2: Find by text
-      if (paidTraffic === 0) {
-        try {
-          const paidLabel = page.locator('text=Paid Traffic').first();
-          if ((await paidLabel.count()) > 0) {
-            const parent = paidLabel.locator('..');
-            const numberText = await parent.textContent();
-            if (numberText) {
-              const numMatch = numberText.match(/([\d,.KMB]+)/i);
-              if (numMatch) {
-                paidTraffic = formatNumber(numMatch[1]);
-              }
-            }
-          }
-        } catch {}
-      }
-
-      // Strategy 3: Regex from page content
-      if (paidTraffic === 0) {
-        const pageContent = await page.content();
-        const paidMatch = pageContent.match(/paid\s*(?:traffic|search)[^]*?([\d,.]+\s*[KMB]?)/i);
-        if (paidMatch) {
-          paidTraffic = formatNumber(paidMatch[1]);
-        }
-      }
-    } catch (err) {
-      console.error("Error extracting paid traffic:", err);
-    }
-
-    // Navigate to organic research for top keywords
-    const topKeywords: TopKeyword[] = [];
-    try {
-      const positionsUrl = `${semrushBaseUrl}/analytics/organic/positions/?q=${encodeURIComponent(domain)}&db=${countryDb}`;
-      await page.goto(positionsUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-      await page.waitForTimeout(5000);
-
-      // Try to wait for the table
-      try {
-        await page.waitForSelector("table, .table, [data-at='positions-table']", { timeout: 10000 });
-      } catch {
-        // Table may have different selector
-      }
-
-      // Extract keywords from the table
-      const rows = await page.locator("table tbody tr, .table__row").all();
-      const keywordLimit = Math.min(rows.length, 20);
-
-      for (let i = 0; i < keywordLimit && topKeywords.length < 5; i++) {
-        try {
-          const row = rows[i];
-          const cells = await row.locator("td, .table__cell").all();
-
-          if (cells.length >= 3) {
-            const keywordText = (await cells[0].textContent())?.trim() || "";
-            const positionText = (await cells[1].textContent())?.trim() || "";
-            const trafficText = (await cells[2].textContent())?.trim() || "";
-
-            const position = parseInt(positionText, 10);
-
-            if (position === 1 && keywordText) {
-              topKeywords.push({
-                keyword: keywordText,
-                traffic: formatNumber(trafficText),
-                position: 1,
-              });
-            }
-          }
-        } catch {
-          continue;
-        }
-      }
-    } catch (err) {
-      console.error("Error extracting top keywords:", err);
-    }
-
-    // Check if domain is a subdomain and get root domain data
+    // Step 6: Check if domain is a subdomain and get root domain data
     let rootDomainData: {
       domain: string;
       organicTraffic: number;
@@ -999,69 +1161,30 @@ async function handleSemrushDomain(req: Request): Promise<Response> {
     } | null = null;
 
     if (isSubdomain(domain)) {
-      try {
-        const rootDomain = getRootDomain(domain);
-        const rootDomainUrl = `${semrushBaseUrl}/analytics/overview/?q=${encodeURIComponent(rootDomain)}&db=${countryDb}`;
+      logStep("SemrushDomain", "Step 6: Domain is subdomain, fetching root domain data...");
+      const rootDomain = getRootDomain(domain);
+      const rootOk = await navigateToSemrushPage(
+        page, semrushBaseUrl, "/analytics/overview/", rootDomain, countryDb
+      );
 
-        await page.goto(rootDomainUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-        await page.waitForTimeout(5000);
-
-        let rootOrganicTraffic = 0;
-        let rootPaidTraffic = 0;
-
-        try {
-          const organicSelectors = [
-            '[data-at="organic-traffic"] .traffic-value',
-            '[data-at="overview-traffic"]',
-          ];
-          for (const selector of organicSelectors) {
-            try {
-              const el = page.locator(selector).first();
-              if ((await el.count()) > 0) {
-                const text = await el.textContent();
-                if (text) {
-                  rootOrganicTraffic = formatNumber(text);
-                  break;
-                }
-              }
-            } catch {
-              continue;
-            }
-          }
-
-          const paidSelectors = [
-            '[data-at="adwords-traffic"] .traffic-value',
-            '[data-at="paid-traffic"]',
-          ];
-          for (const selector of paidSelectors) {
-            try {
-              const el = page.locator(selector).first();
-              if ((await el.count()) > 0) {
-                const text = await el.textContent();
-                if (text) {
-                  rootPaidTraffic = formatNumber(text);
-                  break;
-                }
-              }
-            } catch {
-              continue;
-            }
-          }
-        } catch (err) {
-          console.error("Error extracting root domain data:", err);
-        }
+      if (rootOk) {
+        const rootOrganicTraffic = await extractOrganicTraffic(page);
+        const rootPaidTraffic = await extractPaidTraffic(page);
 
         rootDomainData = {
           domain: rootDomain,
           organicTraffic: rootOrganicTraffic,
           paidTraffic: rootPaidTraffic,
         };
-      } catch (err) {
-        console.error("Error fetching root domain data:", err);
+        logStep("SemrushDomain", `Root domain data: organic=${rootOrganicTraffic}, paid=${rootPaidTraffic}`);
       }
+    } else {
+      logStep("SemrushDomain", "Step 6: Not a subdomain, skipping root domain lookup");
     }
 
     await closeBrowser(browser);
+
+    logStep("SemrushDomain", `SUCCESS: organic=${organicTraffic}, paid=${paidTraffic}, keywords=${topKeywords.length}`);
 
     return jsonResponse({
       success: true,
@@ -1077,12 +1200,36 @@ async function handleSemrushDomain(req: Request): Promise<Response> {
     if (browser) await closeBrowser(browser);
 
     const errMsg = err instanceof Error ? err.message : String(err);
+    logStep("SemrushDomain", `FAILED: ${errMsg}`);
 
+    // Categorize the error for better user feedback
     if (errMsg.includes("login") || errMsg.includes("Login") || errMsg.includes("Could not find")) {
       return jsonResponse(
         {
           success: false,
           error: "SEMrush login failed",
+          details: errMsg,
+        },
+        401
+      );
+    }
+
+    if (errMsg.includes("Gateway page did not redirect")) {
+      return jsonResponse(
+        {
+          success: false,
+          error: "SEMrush gateway redirect failed",
+          details: errMsg,
+        },
+        502
+      );
+    }
+
+    if (errMsg.includes("session may have expired")) {
+      return jsonResponse(
+        {
+          success: false,
+          error: "SEMrush session expired",
           details: errMsg,
         },
         401
@@ -1121,35 +1268,27 @@ async function handleSemrushAds(req: Request): Promise<Response> {
     );
   }
 
+  logStep("SemrushAds", `Starting ad copies query: ${domain} (${country})`);
+
   let browser: Browser | null = null;
 
   try {
-    const { browser: launchedBrowser, context } = await launchBrowser();
+    // Use SEMrush-specific browser launch (NO route bypass!)
+    const { browser: launchedBrowser, context } = await launchSemrushBrowser();
     browser = launchedBrowser;
 
-    // Setup route bypass and anti-detection for the context
-    await setupRouteBypass(context);
-    await context.addInitScript(() => {
-      Object.defineProperty(navigator, "webdriver", { get: () => false });
-      (window as any).chrome = { runtime: {}, app: {} };
-    });
-
-    // Login to SEMrush
-    const page = await semrushLogin(context, loginUrl, cardNumber, password);
+    // Step 1: Login to SEMrush
+    logStep("SemrushAds", "Step 1: Logging in to SEMrush...");
+    const { page, proxyBaseUrl } = await semrushLogin(context, loginUrl, cardNumber, password);
 
     // Determine the base URL for SEMrush navigation
-    const currentUrl = page.url();
-    let semrushBaseUrl: string;
-    if (currentUrl.includes("semrush.com")) {
-      semrushBaseUrl = "https://www.semrush.com";
-    } else {
-      const proxyUrl = new URL(currentUrl);
-      semrushBaseUrl = `${proxyUrl.protocol}//${proxyUrl.host}`;
-      console.log(`Using proxy base URL: ${semrushBaseUrl}`);
-    }
+    const semrushBaseUrl = proxyBaseUrl || "https://www.semrush.com";
+    logStep("SemrushAds", `Using base URL: ${semrushBaseUrl}`);
 
-    // Navigate to Advertising Research → Ad Copies
     const countryDb = country.toUpperCase();
+
+    // Step 2: Navigate to ad copies page
+    logStep("SemrushAds", "Step 2: Navigating to ad copies page...");
     const adCopiesUrl = `${semrushBaseUrl}/advertising/copies/?q=${encodeURIComponent(domain)}&db=${countryDb}&display_type=text`;
 
     await page.goto(adCopiesUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
@@ -1168,100 +1307,119 @@ async function handleSemrushAds(req: Request): Promise<Response> {
     const titles: AdTitle[] = [];
     const descriptions: AdDescription[] = [];
 
-    try {
-      // Strategy 1: Look for structured table rows
-      const rows = await page.locator("table tbody tr, .table__row").all();
-      for (let i = 0; i < rows.length && titles.length < 15; i++) {
-        try {
-          const row = rows[i];
-          const cells = await row.locator("td, .table__cell").all();
+    // Strategy 1: Look for structured table rows
+    const rows = await page.locator("table tbody tr, .table__row").all();
+    for (let i = 0; i < rows.length && titles.length < 15; i++) {
+      try {
+        const row = rows[i];
+        const cells = await row.locator("td, .table__cell").all();
 
-          if (cells.length >= 2) {
-            const titleText = (await cells[0].textContent())?.trim() || "";
-            if (titleText && titles.length < 15) {
-              titles.push({ text: titleText, source: "scraped" });
-            }
+        if (cells.length >= 2) {
+          const titleText = (await cells[0].textContent())?.trim() || "";
+          if (titleText && titles.length < 15) {
+            titles.push({ text: titleText, source: "scraped" });
+          }
 
-            if (cells.length >= 2 && descriptions.length < 4) {
-              const descText = (await cells[1].textContent())?.trim() || "";
-              if (descText && descText !== titleText) {
-                descriptions.push({ text: descText, source: "scraped" });
-              }
+          if (cells.length >= 2 && descriptions.length < 4) {
+            const descText = (await cells[1].textContent())?.trim() || "";
+            if (descText && descText !== titleText) {
+              descriptions.push({ text: descText, source: "scraped" });
             }
           }
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    // Strategy 2: Specific SEMrush ad copy selectors
+    if (titles.length === 0) {
+      const adCopySelectors = [
+        ".ad-copy__title",
+        ".ad-copy__headline",
+        "[data-at='ad-title']",
+        ".AdCopy__title",
+        "h3[class*='ad']",
+        "h4[class*='ad']",
+        ".copy-title",
+      ];
+
+      for (const selector of adCopySelectors) {
+        try {
+          const elements = await page.locator(selector).all();
+          for (let i = 0; i < elements.length && titles.length < 15; i++) {
+            const text = (await elements[i].textContent())?.trim() || "";
+            if (text) {
+              titles.push({ text, source: "scraped" });
+            }
+          }
+          if (titles.length > 0) break;
         } catch {
           continue;
         }
       }
+    }
 
-      // Strategy 2: Specific SEMrush ad copy selectors
-      if (titles.length === 0) {
-        const adCopySelectors = [
-          ".ad-copy__title",
-          ".ad-copy__headline",
-          "[data-at='ad-title']",
-          ".AdCopy__title",
-          "h3[class*='ad']",
-          "h4[class*='ad']",
-          ".copy-title",
-        ];
-
-        for (const selector of adCopySelectors) {
+    // Strategy 3: Look for heading elements with ad-like content
+    if (titles.length === 0) {
+      try {
+        const headings = await page.locator("h3, h4, [class*='title'], [class*='headline']").all();
+        for (let i = 0; i < headings.length && titles.length < 15; i++) {
           try {
-            const elements = await page.locator(selector).all();
-            for (let i = 0; i < elements.length && titles.length < 15; i++) {
-              const text = (await elements[i].textContent())?.trim() || "";
-              if (text) {
-                titles.push({ text, source: "scraped" });
-              }
+            const text = (await headings[i].textContent())?.trim() || "";
+            // Filter out navigation headings and very short text
+            if (text && text.length > 10 && text.length < 200) {
+              titles.push({ text, source: "scraped" });
             }
-            if (titles.length > 0) break;
           } catch {
             continue;
           }
         }
-      }
+      } catch {}
+    }
 
-      if (descriptions.length === 0) {
-        const descSelectors = [
-          ".ad-copy__description",
-          ".ad-copy__text",
-          "[data-at='ad-description']",
-          ".AdCopy__description",
-          ".copy-description",
-          "p[class*='ad']",
-        ];
+    // Extract descriptions from specific elements if not found in table
+    if (descriptions.length === 0) {
+      const descSelectors = [
+        ".ad-copy__description",
+        ".ad-copy__text",
+        "[data-at='ad-description']",
+        ".AdCopy__description",
+        "[class*='description']",
+      ];
 
-        for (const selector of descSelectors) {
-          try {
-            const elements = await page.locator(selector).all();
-            for (let i = 0; i < elements.length && descriptions.length < 4; i++) {
-              const text = (await elements[i].textContent())?.trim() || "";
-              if (text) {
-                descriptions.push({ text, source: "scraped" });
-              }
+      for (const selector of descSelectors) {
+        try {
+          const elements = await page.locator(selector).all();
+          for (let i = 0; i < elements.length && descriptions.length < 4; i++) {
+            const text = (await elements[i].textContent())?.trim() || "";
+            if (text && text.length > 20) {
+              descriptions.push({ text, source: "scraped" });
             }
-            if (descriptions.length > 0) break;
-          } catch {
-            continue;
           }
+          if (descriptions.length > 0) break;
+        } catch {
+          continue;
         }
       }
-    } catch (err) {
-      console.error("Error extracting ad copies:", err);
     }
 
     await closeBrowser(browser);
 
+    logStep("SemrushAds", `SUCCESS: ${titles.length} titles, ${descriptions.length} descriptions`);
+
     return jsonResponse({
       success: true,
-      titles: titles.slice(0, 15),
-      descriptions: descriptions.slice(0, 4),
+      domain,
+      country: countryDb,
+      titles,
+      descriptions,
     });
   } catch (err) {
     if (browser) await closeBrowser(browser);
 
     const errMsg = err instanceof Error ? err.message : String(err);
+    logStep("SemrushAds", `FAILED: ${errMsg}`);
 
     if (errMsg.includes("login") || errMsg.includes("Login") || errMsg.includes("Could not find")) {
       return jsonResponse(
@@ -1271,6 +1429,17 @@ async function handleSemrushAds(req: Request): Promise<Response> {
           details: errMsg,
         },
         401
+      );
+    }
+
+    if (errMsg.includes("Gateway page did not redirect")) {
+      return jsonResponse(
+        {
+          success: false,
+          error: "SEMrush gateway redirect failed",
+          details: errMsg,
+        },
+        502
       );
     }
 
@@ -1286,121 +1455,51 @@ async function handleSemrushAds(req: Request): Promise<Response> {
 }
 
 // ---------------------------------------------------------------------------
-// Router (Node.js HTTP server - compatible with Docker/Node.js runtime)
+// HTTP Server
 // ---------------------------------------------------------------------------
 
-import { createServer, type IncomingMessage, type ServerResponse } from "http";
+const PORT = 3001;
 
-const PORT = parseInt(process.env.PORT || "3001", 10);
+const server = Bun.serve({
+  port: PORT,
+  async fetch(req) {
+    const url = new URL(req.url);
 
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-};
+    // CORS preflight
+    if (req.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type",
+        },
+      });
+    }
 
-function sendJson(res: ServerResponse, data: unknown, status = 200) {
-  const body = JSON.stringify(data);
-  res.writeHead(status, { "Content-Type": "application/json", ...CORS_HEADERS });
-  res.end(body);
-}
-
-function readBody(req: IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on("data", (chunk) => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    req.on("error", reject);
-  });
-}
-
-function toFetchRequest(req: IncomingMessage, body: string): Request {
-  const protocol = (req.headers["x-forwarded-proto"] as string) || "http";
-  const host = req.headers.host || "localhost";
-  const url = `${protocol}://${host}${req.url}`;
-  return new Request(url, {
-    method: req.method,
-    headers: req.headers as Record<string, string>,
-    body: req.method === "GET" || req.method === "HEAD" ? undefined : body,
-  });
-}
-
-async function handleRequest(req: IncomingMessage, res: ServerResponse) {
-  const url = new URL(req.url || "/", `http://localhost:${PORT}`);
-  const method = req.method || "GET";
-
-  // Handle CORS preflight
-  if (method === "OPTIONS") {
-    res.writeHead(204, CORS_HEADERS);
-    res.end();
-    return;
-  }
-
-  try {
     // Health check
-    if (url.pathname === "/health" && method === "GET") {
-      sendJson(res, { status: "ok", timestamp: Date.now() });
-      return;
+    if (url.pathname === "/health" && req.method === "GET") {
+      return jsonResponse({ status: "ok", timestamp: Date.now() });
     }
 
-    // Read body for POST requests
-    let fetchReq: Request;
-    if (method === "POST") {
-      const body = await readBody(req);
-      fetchReq = toFetchRequest(req, body);
-    } else {
-      fetchReq = toFetchRequest(req, "");
+    // Extract endpoint
+    if (url.pathname === "/api/extract" && req.method === "POST") {
+      return handleExtract(req);
     }
 
-    // Extract landing page URL
-    if (url.pathname === "/api/extract" && method === "POST") {
-      const response = await handleExtract(fetchReq);
-      const responseBody = await response.text();
-      sendJson(res, JSON.parse(responseBody), response.status);
-      return;
+    // SEMrush domain endpoint
+    if (url.pathname === "/api/semrush/domain" && req.method === "POST") {
+      return handleSemrushDomain(req);
     }
 
-    // SEMrush domain overview
-    if (url.pathname === "/api/semrush/domain" && method === "POST") {
-      const response = await handleSemrushDomain(fetchReq);
-      const responseBody = await response.text();
-      sendJson(res, JSON.parse(responseBody), response.status);
-      return;
-    }
-
-    // SEMrush ad copies
-    if (url.pathname === "/api/semrush/ads" && method === "POST") {
-      const response = await handleSemrushAds(fetchReq);
-      const responseBody = await response.text();
-      sendJson(res, JSON.parse(responseBody), response.status);
-      return;
+    // SEMrush ads endpoint
+    if (url.pathname === "/api/semrush/ads" && req.method === "POST") {
+      return handleSemrushAds(req);
     }
 
     // 404
-    sendJson(res, { error: "Not found" }, 404);
-  } catch (err) {
-    console.error("Unhandled error in request handler:", err);
-    sendJson(res, {
-      success: false,
-      error: "Internal server error",
-      details: err instanceof Error ? err.message : String(err),
-    }, 500);
-  }
-}
-
-const server = createServer(handleRequest);
-
-server.listen(PORT, () => {
-  console.log(`Scraper service running on port ${PORT}`);
+    return jsonResponse({ error: "Not found" }, 404);
+  },
 });
 
-// Graceful shutdown
-process.on("SIGTERM", () => {
-  console.log("Received SIGTERM, shutting down...");
-  server.close(() => process.exit(0));
-});
-
-process.on("SIGINT", () => {
-  console.log("Received SIGINT, shutting down...");
-  server.close(() => process.exit(0));
-});
+console.log(`Scraper service running on port ${PORT}`);
