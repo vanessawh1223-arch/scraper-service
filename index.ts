@@ -972,12 +972,14 @@ async function handleSemrushDomain(req: Request): Promise<Response> {
       throw new Error("Failed to load domain overview page (session may have expired)");
     }
 
-    // Debug: Log page content summary for extraction debugging
+    // Debug: Collect page content for debugging (included in response)
+    let debugInfo: { pageUrl: string; pageTitle: string; bodyTextPreview: string; semrushBaseUrl: string } | undefined;
     try {
       const pageText = await page.locator('body').innerText().catch(() => "");
-      logStep("SemrushDomain", `Page text preview (first 500 chars): ${pageText.substring(0, 500)}`);
       const pageTitle = await page.title().catch(() => "");
       const pageUrl = page.url();
+      debugInfo = { pageUrl, pageTitle, bodyTextPreview: pageText.substring(0, 1000), semrushBaseUrl };
+      logStep("SemrushDomain", `Page text preview (first 500 chars): ${pageText.substring(0, 500)}`);
       logStep("SemrushDomain", `Page title: "${pageTitle}", URL: ${pageUrl}`);
     } catch {}
 
@@ -1024,6 +1026,7 @@ async function handleSemrushDomain(req: Request): Promise<Response> {
     return jsonResponse({
       success: true, domain, country: countryDb, isSubdomain: isSubdomain(domain),
       organicTraffic, paidTraffic, topKeywords, rootDomainData,
+      debug: debugInfo,
     });
   } catch (err) {
     if (browser) await closeBrowser(browser);
