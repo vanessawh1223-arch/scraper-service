@@ -964,6 +964,32 @@ async function handleSemrushDomain(req: Request): Promise<Response> {
 
     const countryDb = country.toUpperCase();
 
+    // ── Network interception: capture SEMrush API responses ──
+    const capturedApiData: { url: string; body: any }[] = [];
+    page.on('response', async (response) => {
+      try {
+        const url = response.url();
+        // SEMrush API endpoints that return domain analytics data
+        if (
+          url.includes('/analytics/') ||
+          url.includes('/api/') ||
+          url.includes('overview') ||
+          url.includes('organic') ||
+          url.includes('adwords') ||
+          url.includes('paid')
+        ) {
+          const contentType = response.headers()['content-type'] || '';
+          if (contentType.includes('json')) {
+            const jsonBody = await response.json().catch(() => null);
+            if (jsonBody) {
+              capturedApiData.push({ url, body: jsonBody });
+              logStep("SemrushDomain", `Captured API response: ${url.substring(0, 120)}`);
+            }
+          }
+        }
+      } catch {}
+    });
+
     // Step 2: Navigate to domain overview
     logStep("SemrushDomain", "Step 2: Navigating to domain overview...");
     const overviewOk = await navigateToSemrushPage(page, semrushBaseUrl, "/analytics/overview/", domain, countryDb);
@@ -972,26 +998,67 @@ async function handleSemrushDomain(req: Request): Promise<Response> {
       throw new Error("Failed to load domain overview page (session may have expired)");
     }
 
-    // Debug: Collect page content for debugging (included in response)
-    let debugInfo: { pageUrl: string; pageTitle: string; bodyTextPreview: string; semrushBaseUrl: string } | undefined;
+    // Collect debug info from the page
+    let debugInfo: { pageUrl: string; pageTitle: string; bodyTextPreview: string; semrushBaseUrl: string; capturedApiCount: number } | undefined;
     try {
       const pageText = await page.locator('body').innerText().catch(() => "");
       const pageTitle = await page.title().catch(() => "");
       const pageUrl = page.url();
-      debugInfo = { pageUrl, pageTitle, bodyTextPreview: pageText.substring(0, 1000), semrushBaseUrl };
-      logStep("SemrushDomain", `Page text preview (first 500 chars): ${pageText.substring(0, 500)}`);
+      debugInfo = { pageUrl, pageTitle, bodyTextPreview: pageText.substring(0, 1000), semrushBaseUrl, capturedApiCount: capturedApiData.length };
       logStep("SemrushDomain", `Page title: "${pageTitle}", URL: ${pageUrl}`);
+      logStep("SemrushDomain", `Captured ${capturedApiData.length} API responses`);
+      logStep("SemrushDomain", `Page text (first 300): ${pageText.substring(0, 300)}`);
     } catch {}
 
-    // Step 3: Extract organic traffic
-    logStep("SemrushDomain", "Step 3: Extracting organic traffic...");
-    const organicTraffic = await extractOrganicTraffic(page);
-    logStep("SemrushDomain", `Organic traffic: ${organicTraffic}`);
+    // Step 3: Try extracting from captured API data first (most reliable)
+    logStep("SemrushDomain", "Step 3: Extracting data from captured API responses...");
+    let organicTraffic = 0;
+    let paidTraffic = 0;
 
-    // Step 4: Extract paid traffic
-    logStep("SemrushDomain", "Step 4: Extracting paid traffic...");
-    const paidTraffic = await extractPaidTraffic(page);
-    logStep("SemrushDomain", `Paid traffic: ${paidTraffic}`);
+    for (const apiResponse of capturedApiData) {
+      try {
+        const bodyStr = JSON.stringify(apiResponse.body);
+        // Look for organic traffic data in API responses
+        const organicMatch = bodyStr.match(/"organic[^"]*traffic[^"]*":\s*"?([\d,.]+[KMB]?)"?/i) ||
+                            bodyStr.match(/"organic_search_traffic[^"]*":\s*(\d+)/i) ||
+                            bodyStr.match(/"Ot[^"]*":\s*(\d+)/i);
+        if (organicMatch) {
+          const val = formatNumber(organicMatch[1]);
+          if (val > organicTraffic) {
+            organicTraffic = val;
+            logStep("SemrushDomain", `Found organic traffic in API: ${organicMatch[1]} → ${val} (from ${apiResponse.url.substring(0, 80)})`);
+          }
+        }
+        // Look for paid traffic data
+        const paidMatch = bodyStr.match(/"paid[^"]*traffic[^"]*":\s*"?([\d,.]+[KMB]?)"?/i) ||
+                         bodyStr.match(/"adwords[^"]*traffic[^"]*":\s*(\d+)/i) ||
+                         bodyStr.match(/"Ad[^"]*":\s*(\d+)/i) ||
+                         bodyStr.match(/"paid_search_traffic[^"]*":\s*(\d+)/i);
+        if (paidMatch) {
+          const val = formatNumber(paidMatch[1]);
+          if (val > paidTraffic) {
+            paidTraffic = val;
+            logStep("SemrushDomain", `Found paid traffic in API: ${paidMatch[1]} → ${val} (from ${apiResponse.url.substring(0, 80)})`);
+          }
+        }
+      } catch {}
+    }
+
+    // Step 4: If API data didn't work, fall back to DOM extraction
+    if (organicTraffic === 0) {
+      logStep("SemrushDomain", "Step 4: API extraction found nothing, trying DOM extraction...");
+      organicTraffic = await extractOrganicTraffic(page);
+      logStep("SemrushDomain", `Organic traffic (DOM): ${organicTraffic}`);
+    } else {
+      logStep("SemrushDomain", `Organic traffic (API): ${organicTraffic}`);
+    }
+
+    if (paidTraffic === 0) {
+      paidTraffic = await extractPaidTraffic(page);
+      logStep("SemrushDomain", `Paid traffic (DOM): ${paidTraffic}`);
+    } else {
+      logStep("SemrushDomain", `Paid traffic (API): ${paidTraffic}`);
+    }
 
     // Step 5: Navigate to organic positions for top keywords
     logStep("SemrushDomain", "Step 5: Extracting top keywords...");
