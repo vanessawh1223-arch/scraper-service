@@ -928,9 +928,71 @@ async function extractTopKeywords(page: Page, maxPages: number = 10): Promise<To
   const topKeywords: TopKeyword[] = [];
   const MAX_KEYWORDS = 200; // Safety cap
 
+  // ── Scroll down to trigger lazy loading ──
+  logStep("TopKeywords", "Scrolling down to trigger lazy loading...");
   try {
-    await page.waitForSelector("table, .table, [data-at='positions-table']", { timeout: 10000 });
+    await page.evaluate(async () => {
+      // Scroll down in increments to trigger any lazy-loaded content
+      for (let i = 0; i < 5; i++) {
+        window.scrollBy(0, 500);
+        await new Promise(r => setTimeout(r, 300));
+      }
+      // Scroll back to top so table is visible
+      window.scrollTo(0, 0);
+    });
+    await page.waitForTimeout(500);
   } catch {}
+
+  // ── Wait for table with more selectors ──
+  const tableSelectors = [
+    "table",
+    ".table",
+    "[data-at='positions-table']",
+    "[class*='Table']",
+    "[class*='table']",
+    "[data-test='positions-table']",
+    ".data-table",
+    "#positions-table",
+    "[class*='list']",
+    "[role='table']",
+    "[class*='grid']",
+    "[class*='row']",
+  ];
+
+  let tableFound = false;
+  for (const selector of tableSelectors) {
+    try {
+      await page.waitForSelector(selector, { timeout: 3000 });
+      logStep("TopKeywords", `Table element found with selector: ${selector}`);
+      tableFound = true;
+      break;
+    } catch { continue; }
+  }
+
+  if (!tableFound) {
+    logStep("TopKeywords", "No table element found with any selector, trying page.evaluate to find any table-like structure...");
+    // Try to find ANY table-like structure via page.evaluate
+    try {
+      const tableInfo = await page.evaluate(() => {
+        const tables = document.querySelectorAll('table');
+        const divTables = document.querySelectorAll('[class*="table"], [class*="Table"], [class*="grid"], [class*="Grid"], [role="table"]');
+        const allRows = document.querySelectorAll('tr, [role="row"], [class*="row"], [class*="Row"]');
+        return {
+          tableCount: tables.length,
+          divTableCount: divTables.length,
+          rowCount: allRows.length,
+          bodyTextPreview: document.body?.innerText?.substring(0, 500) || '',
+        };
+      });
+      logStep("TopKeywords", `Page table scan: HTML tables=${tableInfo.tableCount}, div tables=${tableInfo.divTableCount}, rows=${tableInfo.rowCount}`);
+      logStep("TopKeywords", `Body text (first 300): ${tableInfo.bodyTextPreview.substring(0, 300)}`);
+
+      if (tableInfo.rowCount === 0 && tableInfo.tableCount === 0 && tableInfo.divTableCount === 0) {
+        logStep("TopKeywords", "No table structures found at all on page, returning empty");
+        return [];
+      }
+    } catch {}
+  }
 
   // ── Parse table header to determine column indices ──
   // SEMrush column short codes (in table header or data-at attributes):
@@ -941,37 +1003,53 @@ async function extractTopKeywords(page: Page, maxPages: number = 10): Promise<To
   let positionCol = 1;  // default: second column
   let trafficCol = -1;  // -1 means not found yet
 
-  try {
-    // Try to read header cells to identify columns
-    const headerCells = await page.locator("table thead th, .table__header th, [data-at='positions-table'] th").all();
-    if (headerCells.length > 0) {
-      for (let i = 0; i < headerCells.length; i++) {
-        const headerText = (await headerCells[i].textContent())?.trim().toLowerCase() || "";
-        const dataAt = await headerCells[i].getAttribute("data-at") || "";
-        const ariaLabel = await headerCells[i].getAttribute("aria-label") || "";
+  // Try multiple header selector patterns
+  const headerSelectors = [
+    "table thead th",
+    ".table__header th",
+    "[data-at='positions-table'] th",
+    "table th",
+    "[role='table'] [role='columnheader']",
+    "[class*='header'] [class*='cell']",
+    "[class*='Header'] [class*='Cell']",
+  ];
 
-        const allText = `${headerText} ${dataAt} ${ariaLabel}`.toLowerCase();
+  for (const headerSelector of headerSelectors) {
+    try {
+      const headerCells = await page.locator(headerSelector).all();
+      if (headerCells.length > 0) {
+        logStep("TopKeywords", `Found ${headerCells.length} header cells with selector: ${headerSelector}`);
+        for (let i = 0; i < headerCells.length; i++) {
+          const headerText = (await headerCells[i].textContent())?.trim().toLowerCase() || "";
+          const dataAt = await headerCells[i].getAttribute("data-at") || "";
+          const ariaLabel = await headerCells[i].getAttribute("aria-label") || "";
 
-        if (allText.includes("keyword") || allText.includes("phrase") || allText === "ph" || dataAt.includes("phrase")) {
-          keywordCol = i;
-        } else if (allText.includes("position") || allText === "po" || allText.includes("pos") || dataAt.includes("position")) {
-          // Make sure it's "position" not "previous position"
-          if (!allText.includes("previous") && !allText.includes("prev") && !allText.includes("pp")) {
-            positionCol = i;
+          const allText = `${headerText} ${dataAt} ${ariaLabel}`.toLowerCase();
+
+          if (i < 8) {
+            logStep("TopKeywords", `  Header[${i}]: text="${headerText.substring(0,30)}", data-at="${dataAt}", aria="${ariaLabel.substring(0,30)}"`);
           }
-        } else if (allText.includes("traffic") || allText === "tr" || dataAt.includes("traffic")) {
-          if (!allText.includes("traffic%") && !allText.includes("traffic percent")) {
-            trafficCol = i;
+
+          if (allText.includes("keyword") || allText.includes("phrase") || allText === "ph" || dataAt.includes("phrase") || allText.includes("关键词")) {
+            keywordCol = i;
+          } else if (allText.includes("position") || allText === "po" || allText.includes("pos") || dataAt.includes("position") || allText.includes("排名") || allText.includes("位置")) {
+            // Make sure it's "position" not "previous position"
+            if (!allText.includes("previous") && !allText.includes("prev") && !allText.includes("pp") && !allText.includes("之前")) {
+              positionCol = i;
+            }
+          } else if (allText.includes("traffic") || allText === "tr" || dataAt.includes("traffic") || allText.includes("流量")) {
+            if (!allText.includes("traffic%") && !allText.includes("traffic percent") && !allText.includes("流量%")) {
+              trafficCol = i;
+            }
+          } else if (allText.includes("volume") || allText === "sv" || allText.includes("search volume") || dataAt.includes("volume") || allText.includes("搜索量") || allText.includes("搜索量")) {
+            // Use search volume as traffic if traffic column not found
+            if (trafficCol === -1) trafficCol = i;
           }
-        } else if (allText.includes("volume") || allText === "sv" || allText.includes("search volume") || dataAt.includes("volume")) {
-          // Use search volume as traffic if traffic column not found
-          if (trafficCol === -1) trafficCol = i;
         }
+        logStep("TopKeywords", `Column mapping: keyword=${keywordCol}, position=${positionCol}, traffic=${trafficCol} (from ${headerCells.length} headers via ${headerSelector})`);
+        break; // Found headers, stop trying selectors
       }
-      logStep("TopKeywords", `Column mapping: keyword=${keywordCol}, position=${positionCol}, traffic=${trafficCol} (from ${headerCells.length} headers)`);
-    }
-  } catch (err) {
-    logStep("TopKeywords", `Could not parse table headers: ${err}`);
+    } catch { continue; }
   }
 
   // If we couldn't find a traffic column, try common SEMrush layouts:
@@ -980,8 +1058,8 @@ async function extractTopKeywords(page: Page, maxPages: number = 10): Promise<To
   if (trafficCol === -1) {
     // Try to determine by examining the first row's cell count and content
     try {
-      const firstRow = await page.locator("table tbody tr, .table__row").first();
-      const cells = await firstRow.locator("td, .table__cell").all();
+      const firstRow = await page.locator("table tbody tr, .table__row, [role='row']").first();
+      const cells = await firstRow.locator("td, .table__cell, [role='cell'], [role='gridcell']").all();
       if (cells.length >= 5) {
         // Likely layout 1: Keyword, Position, Prev Pos, Volume, Traffic
         trafficCol = 3; // Search Volume
@@ -998,24 +1076,67 @@ async function extractTopKeywords(page: Page, maxPages: number = 10): Promise<To
   if (trafficCol === -1) trafficCol = 2;
 
   for (let pageNum = 0; pageNum < maxPages; pageNum++) {
-    const rows = await page.locator("table tbody tr, .table__row").all();
+    // Use multiple row selectors
+    const rowSelectors = [
+      "table tbody tr",
+      ".table__row",
+      "[data-at='positions-table'] tbody tr",
+      "[role='row']",
+      "[class*='row']",
+      "table tr",
+    ];
+
+    let rows: any[] = [];
+    for (const rowSelector of rowSelectors) {
+      try {
+        const candidateRows = await page.locator(rowSelector).all();
+        if (candidateRows.length > 0) {
+          rows = candidateRows;
+          logStep("TopKeywords", `Page ${pageNum + 1}: Found ${rows.length} rows with selector: ${rowSelector}`);
+          break;
+        }
+      } catch { continue; }
+    }
+
+    if (rows.length === 0) {
+      logStep("TopKeywords", `Page ${pageNum + 1}: No rows found with any selector`);
+      break;
+    }
+
     let foundNonPosition1 = false;
     let pageKeywordCount = 0;
+    let allKeywordsCount = 0; // Count ALL keywords found (not just position 1)
 
     for (let i = 0; i < rows.length; i++) {
       if (topKeywords.length >= MAX_KEYWORDS) break;
       try {
         const row = rows[i];
-        const cells = await row.locator("td, .table__cell").all();
+        // Use multiple cell selectors
+        const cellSelectors = ["td, .table__cell", "td, [role='cell']", "td, [role='gridcell']", "td", ".table__cell"];
+        let cells: any[] = [];
+        for (const cellSelector of cellSelectors) {
+          try {
+            const candidateCells = await row.locator(cellSelector).all();
+            if (candidateCells.length > 0) {
+              cells = candidateCells;
+              break;
+            }
+          } catch { continue; }
+        }
+
         if (cells.length > Math.max(keywordCol, positionCol, trafficCol)) {
           const keywordText = (await cells[keywordCol].textContent())?.trim() || "";
           const positionText = (await cells[positionCol].textContent())?.trim() || "";
           const trafficText = (await cells[trafficCol].textContent())?.trim() || "";
           const position = parseInt(positionText, 10);
 
-          // Debug first few rows on first page
-          if (pageNum === 0 && i < 3) {
-            logStep("TopKeywords", `Row ${i}: keyword="${keywordText.substring(0,30)}", pos="${positionText}", traffic="${trafficText}" (cols: ${cells.length})`);
+          // Count all keywords for debugging
+          if (keywordText && !isNaN(position)) allKeywordsCount++;
+
+          // Debug first few rows on first page — log ALL cell contents
+          if (pageNum === 0 && i < 5) {
+            const cellContents = await Promise.all(cells.slice(0, 6).map(async (c: any) => ((await c.textContent())?.trim() || "").substring(0, 30)));
+            logStep("TopKeywords", `Row ${i} (${cells.length} cols): [${cellContents.map((c: string) => `"${c}"`).join(', ')}]`);
           }
 
           if (position === 1 && keywordText) {
@@ -1028,35 +1149,301 @@ async function extractTopKeywords(page: Page, maxPages: number = 10): Promise<To
       } catch { continue; }
     }
 
-    logStep("TopKeywords", `Page ${pageNum + 1}: found ${pageKeywordCount} position-1 keywords, total=${topKeywords.length}`);
+    logStep("TopKeywords", `Page ${pageNum + 1}: found ${pageKeywordCount} position-1 keywords (of ${allKeywordsCount} total rows with keywords), total=${topKeywords.length}`);
 
     if (foundNonPosition1 || topKeywords.length >= MAX_KEYWORDS) {
       break;
     }
 
-    // Try to click "next page" / pagination button
-    try {
-      const nextButton = page.locator("[data-at='pagination-next'], .pagination__next, button[aria-label='Next page'], a[rel='next'], .pager__item--next").first();
-      const isVisible = await nextButton.isVisible().catch(() => false);
-      if (!isVisible) {
-        logStep("TopKeywords", "No more pages available");
-        break;
-      }
-      await nextButton.click();
-      await page.waitForTimeout(1500); // Reduced from 2000ms
+    // Try to click "next page" / pagination button — with more selectors
+    let paginated = false;
+    const paginationSelectors = [
+      "[data-at='pagination-next']",
+      ".pagination__next",
+      "button[aria-label='Next page']",
+      "a[rel='next']",
+      ".pager__item--next",
+      "[class*='next']",
+      "[class*='Next']",
+      "button:has-text('下一页')",
+      "a:has-text('下一页')",
+      "button:has-text('Next')",
+      "a:has-text('Next')",
+      "[aria-label*='next' i]",
+      "[data-test*='next']",
+    ];
+
+    for (const pagSelector of paginationSelectors) {
       try {
-        await page.waitForSelector("table, .table, [data-at='positions-table']", { timeout: 8000 });
-      } catch {
-        logStep("TopKeywords", "Table not found after pagination, stopping");
-        break;
-      }
-    } catch {
-      logStep("TopKeywords", "Could not find or click next page button, stopping");
+        const nextButton = page.locator(pagSelector).first();
+        const isVisible = await nextButton.isVisible().catch(() => false);
+        if (isVisible) {
+          await nextButton.click();
+          logStep("TopKeywords", `Clicked next page with selector: ${pagSelector}`);
+          await page.waitForTimeout(1500);
+          // Re-scroll after pagination
+          try {
+            await page.evaluate(async () => {
+              for (let j = 0; j < 3; j++) {
+                window.scrollBy(0, 500);
+                await new Promise(r => setTimeout(r, 200));
+              }
+              window.scrollTo(0, 0);
+            });
+          } catch {}
+          try {
+            await page.waitForSelector("table, .table, [data-at='positions-table'], [class*='Table'], [class*='table']", { timeout: 8000 });
+          } catch {
+            logStep("TopKeywords", "Table not found after pagination, stopping");
+            paginated = false;
+            break;
+          }
+          paginated = true;
+          break;
+        }
+      } catch { continue; }
+    }
+
+    if (!paginated) {
+      logStep("TopKeywords", "No more pages available or pagination button not found");
       break;
     }
   }
 
   logStep("TopKeywords", `Extracted ${topKeywords.length} position-1 keywords total`);
+
+  // ── FALLBACK: If no keywords found with column-based parsing, try generic table extraction ──
+  if (topKeywords.length === 0) {
+    logStep("TopKeywords", "Column-based extraction found 0 keywords, trying generic table extraction...");
+    try {
+      const genericKeywords = await page.evaluate(() => {
+        const results: { keyword: string; position: number; traffic: number }[] = [];
+        // Find ALL tables on the page
+        const tables = document.querySelectorAll('table, [role="table"]');
+        for (const table of tables) {
+          const rows = table.querySelectorAll('tr, [role="row"]');
+          let localKeywordCol = 0;
+          let localPositionCol = -1;
+          let localTrafficCol = -1;
+
+          // Parse headers
+          const headers = table.querySelectorAll('th, [role="columnheader"]');
+          if (headers.length > 0) {
+            headers.forEach((h, i) => {
+              const txt = (h.textContent || '').toLowerCase() + ' ' + (h.getAttribute('data-at') || '').toLowerCase();
+              if (txt.includes('keyword') || txt.includes('phrase') || txt.includes('ph') || txt.includes('关键词')) localKeywordCol = i;
+              else if ((txt.includes('position') || txt.includes('po') || txt.includes('排名') || txt.includes('位置')) && !txt.includes('prev')) localPositionCol = i;
+              else if (txt.includes('volume') || txt.includes('sv') || txt.includes('搜索量') || txt.includes('traffic') || txt.includes('tr') || txt.includes('流量')) {
+                if (localTrafficCol === -1) localTrafficCol = i;
+              }
+            });
+          }
+
+          if (localPositionCol === -1) localPositionCol = 1;
+          if (localTrafficCol === -1) localTrafficCol = Math.min(2, headers.length > 0 ? headers.length - 1 : 2);
+
+          // Parse body rows
+          for (const row of rows) {
+            const cells = row.querySelectorAll('td, [role="cell"], [role="gridcell"]');
+            if (cells.length <= Math.max(localKeywordCol, localPositionCol)) continue;
+            const kw = (cells[localKeywordCol]?.textContent || '').trim();
+            const posStr = (cells[localPositionCol]?.textContent || '').trim();
+            const pos = parseInt(posStr, 10);
+            const trafficStr = localTrafficCol < cells.length ? (cells[localTrafficCol]?.textContent || '').trim() : '0';
+            if (kw && pos === 1 && kw.length > 1 && kw.length < 200) {
+              results.push({ keyword: kw, position: 1, traffic: parseInt(trafficStr.replace(/[,%]/g, ''), 10) || 0 });
+            }
+          }
+        }
+        return results;
+      });
+
+      if (genericKeywords.length > 0) {
+        logStep("TopKeywords", `Generic table extraction found ${genericKeywords.length} position-1 keywords`);
+        const seen = new Set(topKeywords.map(k => k.keyword.toLowerCase()));
+        for (const kw of genericKeywords) {
+          if (!seen.has(kw.keyword.toLowerCase()) && topKeywords.length < MAX_KEYWORDS) {
+            seen.add(kw.keyword.toLowerCase());
+            topKeywords.push(kw);
+          }
+        }
+      }
+    } catch (err) {
+      logStep("TopKeywords", `Generic table extraction failed: ${err}`);
+    }
+  }
+
+  return topKeywords;
+}
+
+/**
+ * Try to extract keywords from inline <script> tags on the page.
+ * Many SEMrush proxy pages embed data in script tags (e.g., __NEXT_DATA__, window.__INITIAL_STATE__, etc.)
+ */
+async function extractKeywordsFromScripts(page: Page): Promise<TopKeyword[]> {
+  const topKeywords: TopKeyword[] = [];
+  const MAX_KEYWORDS = 200;
+  const seenKeywords = new Set<string>();
+
+  logStep("TopKeywords-Scripts", "Attempting to extract keywords from inline <script> tags...");
+
+  try {
+    const scriptData = await page.evaluate(() => {
+      const results: { src: string; content: string }[] = [];
+      const scripts = document.querySelectorAll('script');
+      for (const script of scripts) {
+        // Only look at inline scripts (no src attribute or src is empty)
+        const src = script.getAttribute('src') || '';
+        const content = script.textContent || '';
+        // Skip tiny scripts and known non-data scripts
+        if (content.length < 50) continue;
+        if (content.includes('document.createElement') && !content.includes('keyword')) continue;
+        // Look for scripts that contain keyword-like data patterns
+        if (
+          content.includes('"Ph"') || content.includes('"Po"') ||
+          content.includes('"keyword"') || content.includes('"Keyword"') ||
+          content.includes('"position"') || content.includes('"Position"') ||
+          content.includes('__NEXT_DATA__') || content.includes('__INITIAL_STATE__') ||
+          content.includes('__NUXT__') || content.includes('window.__data') ||
+          content.includes('"organic"') || content.includes('"positions"') ||
+          // Chinese proxy might embed data differently
+          content.includes('关键词') || content.includes('排名') || content.includes('搜索量')
+        ) {
+          results.push({ src, content: content.substring(0, 50000) }); // Cap at 50KB per script
+        }
+      }
+      return results;
+    });
+
+    logStep("TopKeywords-Scripts", `Found ${scriptData.length} potentially relevant inline scripts`);
+
+    for (const script of scriptData) {
+      if (topKeywords.length >= MAX_KEYWORDS) break;
+
+      const content = script.content;
+
+      // Try parsing as __NEXT_DATA__ JSON
+      if (content.includes('__NEXT_DATA__')) {
+        try {
+          const jsonMatch = content.match(/__NEXT_DATA__\s*=\s*({[\s\S]*?})\s*;?\s*<\/script>/) ||
+                           content.match(/__NEXT_DATA__\s*=\s*({[\s\S]*})/);
+          if (jsonMatch) {
+            const jsonData = JSON.parse(jsonMatch[1]);
+            // Deep search for keyword arrays in Next.js data
+            const searchForKeywords = (obj: any, depth = 0): TopKeyword[] => {
+              const found: TopKeyword[] = [];
+              if (depth > 8 || !obj || typeof obj !== 'object') return found;
+              if (Array.isArray(obj)) {
+                for (const entry of obj) {
+                  if (entry && typeof entry === 'object') {
+                    const keyword = entry.Ph || entry.Keyword || entry.keyword || entry.kw || "";
+                    const position = parseInt(entry.Po || entry.Position || entry.position || entry.pos || entry.rank || "0", 10);
+                    const trafficRaw = entry.Sv || entry.Tr || entry.volume || entry.traffic || entry.search_volume || "0";
+                    const traffic = typeof trafficRaw === 'number' ? trafficRaw : formatNumber(String(trafficRaw));
+                    if (position === 1 && keyword && !seenKeywords.has(String(keyword).toLowerCase())) {
+                      seenKeywords.add(String(keyword).toLowerCase());
+                      found.push({ keyword: String(keyword), traffic, position: 1 });
+                    }
+                  }
+                }
+                return found;
+              }
+              for (const key of Object.keys(obj)) {
+                found.push(...searchForKeywords(obj[key], depth + 1));
+              }
+              return found;
+            };
+            const found = searchForKeywords(jsonData);
+            topKeywords.push(...found.slice(0, MAX_KEYWORDS - topKeywords.length));
+            if (found.length > 0) {
+              logStep("TopKeywords-Scripts", `Found ${found.length} keywords from __NEXT_DATA__`);
+            }
+          }
+        } catch (e) {
+          logStep("TopKeywords-Scripts", `Failed to parse __NEXT_DATA__: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+
+      // Try parsing as __INITIAL_STATE__ or __NUXT__
+      if (content.includes('__INITIAL_STATE__') || content.includes('__NUXT__') || content.includes('__data')) {
+        try {
+          const jsonMatch = content.match(/(?:__INITIAL_STATE__|__NUXT__|__data)\s*=\s*({[\s\S]*?})\s*;?\s*<\/script>/) ||
+                           content.match(/(?:__INITIAL_STATE__|__NUXT__|__data)\s*=\s*({[\s\S]*})/);
+          if (jsonMatch) {
+            const jsonData = JSON.parse(jsonMatch[1]);
+            const searchForKeywords = (obj: any, depth = 0): TopKeyword[] => {
+              const found: TopKeyword[] = [];
+              if (depth > 8 || !obj || typeof obj !== 'object') return found;
+              if (Array.isArray(obj)) {
+                for (const entry of obj) {
+                  if (entry && typeof entry === 'object') {
+                    const keyword = entry.Ph || entry.Keyword || entry.keyword || entry.kw || "";
+                    const position = parseInt(entry.Po || entry.Position || entry.position || entry.pos || entry.rank || "0", 10);
+                    const trafficRaw = entry.Sv || entry.Tr || entry.volume || entry.traffic || entry.search_volume || "0";
+                    const traffic = typeof trafficRaw === 'number' ? trafficRaw : formatNumber(String(trafficRaw));
+                    if (position === 1 && keyword && !seenKeywords.has(String(keyword).toLowerCase())) {
+                      seenKeywords.add(String(keyword).toLowerCase());
+                      found.push({ keyword: String(keyword), traffic, position: 1 });
+                    }
+                  }
+                }
+                return found;
+              }
+              for (const key of Object.keys(obj)) {
+                found.push(...searchForKeywords(obj[key], depth + 1));
+              }
+              return found;
+            };
+            const found = searchForKeywords(jsonData);
+            topKeywords.push(...found.slice(0, MAX_KEYWORDS - topKeywords.length));
+            if (found.length > 0) {
+              logStep("TopKeywords-Scripts", `Found ${found.length} keywords from initial state data`);
+            }
+          }
+        } catch (e) {
+          logStep("TopKeywords-Scripts", `Failed to parse initial state: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+
+      // Try regex patterns on script content (same patterns as API extraction)
+      if (topKeywords.length < MAX_KEYWORDS) {
+        // Pattern: Ph/Po/Sv in any order
+        const patterns = [
+          /\{[^{}]*"Ph"\s*:\s*"([^"]+)"[^{}]*"Po"\s*:\s*(\d+)[^{}]*"Sv"\s*:\s*([\d,.]+)[^{}]*\}/g,
+          /\{[^{}]*"Ph"\s*:\s*"([^"]+)"[^{}]*"Po"\s*:\s*(\d+)[^{}]*"Tr"\s*:\s*([\d,.]+)[^{}]*\}/g,
+          /\{[^{}]*"Po"\s*:\s*(\d+)[^{}]*"Ph"\s*:\s*"([^"]+)"[^{}]*"Sv"\s*:\s*([\d,.]+)[^{}]*\}/g,
+          /\{[^{}]*"Po"\s*:\s*(\d+)[^{}]*"Ph"\s*:\s*"([^"]+)"[^{}]*"Tr"\s*:\s*([\d,.]+)[^{}]*\}/g,
+          /\{[^{}]*"keyword"\s*:\s*"([^"]+)"[^{}]*"position"\s*:\s*(\d+)[^{}]*"volume"\s*:\s*([\d,.]+)[^{}]*\}/gi,
+          /\{[^{}]*"keyword"\s*:\s*"([^"]+)"[^{}]*"pos"\s*:\s*(\d+)[^{}]*"sv"\s*:\s*([\d,.]+)[^{}]*\}/gi,
+        ];
+
+        for (const pattern of patterns) {
+          if (topKeywords.length >= MAX_KEYWORDS) break;
+          let match;
+          while ((match = pattern.exec(content)) !== null && topKeywords.length < MAX_KEYWORDS) {
+            // For patterns 3 and 4 (Po before Ph), the capture groups are in different order
+            const isPoFirst = pattern.source.startsWith('"Po"') || pattern.source.startsWith('Po');
+            const keyword = isPoFirst ? match[2] : match[1];
+            const position = parseInt(isPoFirst ? match[1] : match[2], 10);
+            const traffic = formatNumber(match[3]);
+            if (position === 1 && keyword && !seenKeywords.has(keyword.toLowerCase())) {
+              seenKeywords.add(keyword.toLowerCase());
+              topKeywords.push({ keyword, traffic, position: 1 });
+            }
+          }
+        }
+      }
+    }
+
+    if (topKeywords.length > 0) {
+      logStep("TopKeywords-Scripts", `Extracted ${topKeywords.length} position-1 keywords from inline scripts`);
+    } else {
+      logStep("TopKeywords-Scripts", `No keywords found in inline scripts`);
+    }
+  } catch (err) {
+    logStep("TopKeywords-Scripts", `Script extraction failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
   return topKeywords;
 }
 
@@ -1071,10 +1458,20 @@ function extractKeywordsFromApiData(capturedApiData: { url: string; body: any }[
   const MAX_KEYWORDS = 200;
   const seenKeywords = new Set<string>();
 
+  // Log all captured API URLs for debugging
+  logStep("TopKeywords-API", `Processing ${capturedApiData.length} captured API responses`);
+  for (const apiResponse of capturedApiData) {
+    logStep("TopKeywords-API", `  URL: ${apiResponse.url.substring(0, 150)} | body preview: ${JSON.stringify(apiResponse.body).substring(0, 200)}`);
+  }
+
+  // Also try ALL API responses (not just organic/positions/analytics)
+  // Some proxy versions may use different URL patterns
   for (const apiResponse of capturedApiData) {
     try {
       const url = apiResponse.url;
-      if (!url.includes('organic') && !url.includes('positions') && !url.includes('analytics')) continue;
+      // Relaxed URL filter — also try responses that don't match the usual keywords
+      const isRelevantUrl = url.includes('organic') || url.includes('positions') || url.includes('analytics') ||
+                            url.includes('keyword') || url.includes('search') || url.includes('report');
 
       const body = apiResponse.body;
       const bodyStr = JSON.stringify(body);
@@ -1086,15 +1483,23 @@ function extractKeywordsFromApiData(capturedApiData: { url: string; body: any }[
           if (topKeywords.length >= MAX_KEYWORDS) break;
           if (!entry || typeof entry !== 'object') continue;
 
-          const keyword = entry.Ph || entry.Keyword || entry.keyword || entry.keyword_phrase || "";
-          const position = parseInt(entry.Po || entry.Position || entry.position || entry.pos || "0", 10);
-          // Traffic can be Tr (traffic %), Sv (search volume), or Tc (traffic cost)
-          const trafficRaw = entry.Sv || entry.Tr || entry.Tc || entry.volume || entry.traffic || entry.Traffic || "0";
+          // Try many keyword field name variants
+          const keyword = entry.Ph || entry.Keyword || entry.keyword || entry.keyword_phrase ||
+                          entry.kw || entry.Kw || entry.query || entry.Query || entry.term || entry.search_term || "";
+          const position = parseInt(entry.Po || entry.Position || entry.position || entry.pos || entry.Pos || entry.rank || entry.Rank || "0", 10);
+          // Traffic can be Tr (traffic %), Sv (search volume), Tc (traffic cost), or other names
+          const trafficRaw = entry.Sv || entry.Tr || entry.Tc || entry.volume || entry.traffic || entry.Traffic ||
+                             entry.search_volume || entry.SearchVolume || entry.sv || entry.tr || entry.Vol || entry.vol || "0";
           const traffic = typeof trafficRaw === 'number' ? trafficRaw : formatNumber(String(trafficRaw));
 
-          if (position === 1 && keyword && !seenKeywords.has(keyword.toLowerCase())) {
-            seenKeywords.add(keyword.toLowerCase());
-            topKeywords.push({ keyword, traffic, position: 1 });
+          // Log every entry found for debugging (first 10 only)
+          if (topKeywords.length < 10 && keyword) {
+            logStep("TopKeywords-API", `  Entry: keyword="${String(keyword).substring(0,40)}", position=${position}, traffic=${traffic}, fields=${Object.keys(entry).join(',')}`);
+          }
+
+          if (position === 1 && keyword && !seenKeywords.has(String(keyword).toLowerCase())) {
+            seenKeywords.add(String(keyword).toLowerCase());
+            topKeywords.push({ keyword: String(keyword), traffic, position: 1 });
           }
         }
       };
@@ -1104,16 +1509,18 @@ function extractKeywordsFromApiData(capturedApiData: { url: string; body: any }[
         tryParseEntries(body);
       }
 
-      // Try nested data arrays
+      // Try nested data arrays — increased depth and more key names
       const tryNested = (obj: any, depth = 0) => {
-        if (depth > 3 || topKeywords.length >= MAX_KEYWORDS) return;
+        if (depth > 5 || topKeywords.length >= MAX_KEYWORDS) return;
         if (!obj || typeof obj !== 'object') return;
         if (Array.isArray(obj)) {
           tryParseEntries(obj);
           return;
         }
         for (const key of Object.keys(obj)) {
-          if (key === 'data' || key === 'results' || key === 'rows') {
+          // Look for known data container keys and any key containing arrays of objects
+          if (key === 'data' || key === 'results' || key === 'rows' || key === 'items' ||
+              key === 'records' || key === 'list' || key === 'entries' || key === 'keywords') {
             if (Array.isArray(obj[key])) {
               tryParseEntries(obj[key]);
             }
@@ -1132,12 +1539,15 @@ function extractKeywordsFromApiData(capturedApiData: { url: string; body: any }[
 
       // ── Strategy 2: Regex-based parsing for stringified API responses ──
       // Pattern 1: Ph/Po/Sv (most common in SEMrush API - Sv = search volume)
-      const svPattern = /\{[^{}]*"Ph"\s*:\s*"([^"]+)"[^{}]*"Po"\s*:\s*(\d+)[^{}]*"Sv"\s*:\s*([\d,.]+)/g;
+      // Allow fields in ANY order within the JSON object
+      const makeFlexiblePattern = (kwField: string, posField: string, volField: string) =>
+        new RegExp(`\\{[^{}]*"${kwField}"\\s*:\\s*"([^"]+)"[^{}]*"${posField}"\\s*:\\s*(\\d+)[^{}]*"${volField}"\\s*:\\s*([\\d,.]+)[^{}]*\\}`, 'g');
+
+      // Try Ph/Po/Sv in original order
       let match;
-      while ((match = svPattern.exec(bodyStr)) !== null && topKeywords.length < MAX_KEYWORDS) {
-        const keyword = match[1];
-        const position = parseInt(match[2], 10);
-        const traffic = formatNumber(match[3]);
+      const svPattern1 = makeFlexiblePattern('Ph', 'Po', 'Sv');
+      while ((match = svPattern1.exec(bodyStr)) !== null && topKeywords.length < MAX_KEYWORDS) {
+        const keyword = match[1], position = parseInt(match[2], 10), traffic = formatNumber(match[3]);
         if (position === 1 && keyword && !seenKeywords.has(keyword.toLowerCase())) {
           seenKeywords.add(keyword.toLowerCase());
           topKeywords.push({ keyword, traffic, position: 1 });
@@ -1145,14 +1555,86 @@ function extractKeywordsFromApiData(capturedApiData: { url: string; body: any }[
       }
 
       // Pattern 2: Ph/Po/Tr (Tr = traffic percentage)
-      const trPattern = /\{[^{}]*"Ph"\s*:\s*"([^"]+)"[^{}]*"Po"\s*:\s*(\d+)[^{}]*"Tr"\s*:\s*([\d,.]+)/g;
-      while ((match = trPattern.exec(bodyStr)) !== null && topKeywords.length < MAX_KEYWORDS) {
-        const keyword = match[1];
-        const position = parseInt(match[2], 10);
-        const traffic = formatNumber(match[3]);
+      const trPattern1 = makeFlexiblePattern('Ph', 'Po', 'Tr');
+      while ((match = trPattern1.exec(bodyStr)) !== null && topKeywords.length < MAX_KEYWORDS) {
+        const keyword = match[1], position = parseInt(match[2], 10), traffic = formatNumber(match[3]);
         if (position === 1 && keyword && !seenKeywords.has(keyword.toLowerCase())) {
           seenKeywords.add(keyword.toLowerCase());
           topKeywords.push({ keyword, traffic, position: 1 });
+        }
+      }
+
+      // Pattern 3: lowercase "keyword"/"position"/"volume" fields
+      const lcPattern = /\{[^{}]*"keyword"\s*:\s*"([^"]+)"[^{}]*"position"\s*:\s*(\d+)[^{}]*"volume"\s*:\s*([\d,.]+)[^{}]*\}/gi;
+      while ((match = lcPattern.exec(bodyStr)) !== null && topKeywords.length < MAX_KEYWORDS) {
+        const keyword = match[1], position = parseInt(match[2], 10), traffic = formatNumber(match[3]);
+        if (position === 1 && keyword && !seenKeywords.has(keyword.toLowerCase())) {
+          seenKeywords.add(keyword.toLowerCase());
+          topKeywords.push({ keyword, traffic, position: 1 });
+        }
+      }
+
+      // Pattern 4: lowercase "keyword"/"pos"/"sv" fields
+      const lcPattern2 = /\{[^{}]*"keyword"\s*:\s*"([^"]+)"[^{}]*"pos"\s*:\s*(\d+)[^{}]*"sv"\s*:\s*([\d,.]+)[^{}]*\}/gi;
+      while ((match = lcPattern2.exec(bodyStr)) !== null && topKeywords.length < MAX_KEYWORDS) {
+        const keyword = match[1], position = parseInt(match[2], 10), traffic = formatNumber(match[3]);
+        if (position === 1 && keyword && !seenKeywords.has(keyword.toLowerCase())) {
+          seenKeywords.add(keyword.toLowerCase());
+          topKeywords.push({ keyword, traffic, position: 1 });
+        }
+      }
+
+      // Pattern 5: Very relaxed — just find any object with a "Ph" field that also has a "Po" field
+      // This catches cases where the field order is unusual
+      const relaxedPattern = /\{[^{}]*"Ph"\s*:\s*"([^"]+)"[^{}]*\}[^{}]*\{[^{}]*"Po"\s*:\s*(\d+)[^{}]*\}/g;
+      // Skip this pattern if we already found keywords — it's too loose
+
+      // Pattern 6: "Ph" and "Po" in any order within the same object — flexible regex
+      const flexPhPo = /\{"[^"]*"\s*:\s*"[^"]*"(?:,"[^"]*"\s*:\s*[^,}]+)*"Ph"\s*:\s*"([^"]+)"(?:,"[^"]*"\s*:\s*[^,}]+)*"Po"\s*:\s*(\d+)/g;
+      while ((match = flexPhPo.exec(bodyStr)) !== null && topKeywords.length < MAX_KEYWORDS) {
+        const keyword = match[1], position = parseInt(match[2], 10);
+        // Try to find Sv or Tr in the same object
+        const fullObj = match[0];
+        const svMatch = fullObj.match(/"Sv"\s*:\s*([\d,.]+)/);
+        const trMatch = fullObj.match(/"Tr"\s*:\s*([\d,.]+)/);
+        const traffic = svMatch ? formatNumber(svMatch[1]) : trMatch ? formatNumber(trMatch[1]) : 0;
+        if (position === 1 && keyword && !seenKeywords.has(keyword.toLowerCase())) {
+          seenKeywords.add(keyword.toLowerCase());
+          topKeywords.push({ keyword, traffic, position: 1 });
+        }
+      }
+
+      // Pattern 7: Po comes BEFORE Ph in the JSON object
+      const poPhPattern = /\{[^{}]*"Po"\s*:\s*(\d+)[^{}]*"Ph"\s*:\s*"([^"]+)"[^{}]*"Sv"\s*:\s*([\d,.]+)[^{}]*\}/g;
+      while ((match = poPhPattern.exec(bodyStr)) !== null && topKeywords.length < MAX_KEYWORDS) {
+        const position = parseInt(match[1], 10), keyword = match[2], traffic = formatNumber(match[3]);
+        if (position === 1 && keyword && !seenKeywords.has(keyword.toLowerCase())) {
+          seenKeywords.add(keyword.toLowerCase());
+          topKeywords.push({ keyword, traffic, position: 1 });
+        }
+      }
+
+      // Pattern 8: Po comes before Ph, with Tr instead of Sv
+      const poPhTrPattern = /\{[^{}]*"Po"\s*:\s*(\d+)[^{}]*"Ph"\s*:\s*"([^"]+)"[^{}]*"Tr"\s*:\s*([\d,.]+)[^{}]*\}/g;
+      while ((match = poPhTrPattern.exec(bodyStr)) !== null && topKeywords.length < MAX_KEYWORDS) {
+        const position = parseInt(match[1], 10), keyword = match[2], traffic = formatNumber(match[3]);
+        if (position === 1 && keyword && !seenKeywords.has(keyword.toLowerCase())) {
+          seenKeywords.add(keyword.toLowerCase());
+          topKeywords.push({ keyword, traffic, position: 1 });
+        }
+      }
+
+      // Even try non-relevant URLs if we still have 0 keywords
+      if (!isRelevantUrl && topKeywords.length === 0 && bodyStr.includes('Po') && bodyStr.includes('Ph')) {
+        logStep("TopKeywords-API", `Trying non-standard URL that contains Po/Ph: ${url.substring(0, 120)}`);
+        // Re-run the regex patterns on this response
+        const reSv = /\{[^{}]*"Ph"\s*:\s*"([^"]+)"[^{}]*"Po"\s*:\s*(\d+)[^{}]*"Sv"\s*:\s*([\d,.]+)/g;
+        while ((match = reSv.exec(bodyStr)) !== null && topKeywords.length < MAX_KEYWORDS) {
+          const keyword = match[1], position = parseInt(match[2], 10), traffic = formatNumber(match[3]);
+          if (position === 1 && keyword && !seenKeywords.has(keyword.toLowerCase())) {
+            seenKeywords.add(keyword.toLowerCase());
+            topKeywords.push({ keyword, traffic, position: 1 });
+          }
         }
       }
     } catch { continue; }
@@ -1251,7 +1733,8 @@ async function querySingleDomain(
     const responseListener = async (response: any) => {
       try {
         const url = response.url();
-        if (url.includes('/analytics/') || url.includes('/api/') || url.includes('overview') || url.includes('organic') || url.includes('adwords') || url.includes('paid')) {
+        // Broadened matching — proxy versions may use different URL patterns
+        if (url.includes('/analytics/') || url.includes('/api/') || url.includes('overview') || url.includes('organic') || url.includes('adwords') || url.includes('paid') || url.includes('keyword') || url.includes('search') || url.includes('report') || url.includes('positions')) {
           const contentType = response.headers()['content-type'] || '';
           if (contentType.includes('json')) {
             const jsonBody = await response.json().catch(() => null);
@@ -1297,9 +1780,40 @@ async function querySingleDomain(
     } catch {}
     
     if (positionsOk) {
+      // Extra wait + scroll to ensure table is fully loaded
       await page.waitForTimeout(2000);
+      try {
+        await page.evaluate(async () => {
+          for (let i = 0; i < 8; i++) {
+            window.scrollBy(0, 600);
+            await new Promise(r => setTimeout(r, 400));
+          }
+          window.scrollTo(0, 0);
+        });
+        await page.waitForTimeout(1000);
+      } catch {}
+
+      // Strategy 1: API extraction
       topKeywords = extractKeywordsFromApiData(capturedApiData);
+      // Strategy 2: DOM scraping
       if (topKeywords.length === 0) topKeywords = await extractTopKeywords(page);
+      // Strategy 3: Inline script extraction
+      if (topKeywords.length === 0) topKeywords = await extractKeywordsFromScripts(page);
+
+      // Debug dump when keywords = 0
+      if (topKeywords.length === 0) {
+        logStep("BatchQuery", `KEYWORD DEBUG for ${domain}: 0 keywords found. API responses=${capturedApiData.length}`);
+        for (let i = 0; i < Math.min(capturedApiData.length, 5); i++) {
+          logStep("BatchQuery", `  API[${i}] URL: ${capturedApiData[i].url.substring(0, 120)} | body: ${JSON.stringify(capturedApiData[i].body).substring(0, 300)}`);
+        }
+        try {
+          const tableInfo = await page.evaluate(() => {
+            const tables = document.querySelectorAll('table');
+            return { tableCount: tables.length, bodyPreview: document.body?.innerText?.substring(0, 300) || '' };
+          });
+          logStep("BatchQuery", `  Tables: ${tableInfo.tableCount}, body: ${tableInfo.bodyPreview}`);
+        } catch {}
+      }
     }
 
     // Step 4: Root domain data for subdomains
@@ -1355,14 +1869,18 @@ async function handleSemrushDomain(req: Request): Promise<Response> {
     page.on('response', async (response) => {
       try {
         const url = response.url();
-        // SEMrush API endpoints that return domain analytics data
+        // Broadened SEMrush API endpoint matching — proxy versions may use different URL patterns
         if (
           url.includes('/analytics/') ||
           url.includes('/api/') ||
           url.includes('overview') ||
           url.includes('organic') ||
           url.includes('adwords') ||
-          url.includes('paid')
+          url.includes('paid') ||
+          url.includes('keyword') ||
+          url.includes('search') ||
+          url.includes('report') ||
+          url.includes('positions')
         ) {
           const contentType = response.headers()['content-type'] || '';
           if (contentType.includes('json')) {
@@ -1471,15 +1989,94 @@ async function handleSemrushDomain(req: Request): Promise<Response> {
       }
     }
     if (positionsOk) {
+      // Extra wait + scroll to ensure table is fully loaded (proxy pages can be slow / use lazy loading)
       await page.waitForTimeout(2000);
-      // Try API extraction first (more reliable)
+      logStep("SemrushDomain", "Scrolling positions page to trigger lazy loading...");
+      try {
+        await page.evaluate(async () => {
+          for (let i = 0; i < 8; i++) {
+            window.scrollBy(0, 600);
+            await new Promise(r => setTimeout(r, 400));
+          }
+          window.scrollTo(0, 0);
+        });
+        await page.waitForTimeout(1000);
+      } catch {}
+
+      // Strategy 1: Try API extraction first (most reliable)
       topKeywords = extractKeywordsFromApiData(capturedApiData);
       if (topKeywords.length > 0) {
         logStep("SemrushDomain", `Got ${topKeywords.length} keywords from API data`);
       } else {
-        // Fall back to DOM scraping with pagination support
+        // Strategy 2: Fall back to DOM scraping with pagination support
         logStep("SemrushDomain", "API extraction yielded no keywords, falling back to DOM scraping...");
         topKeywords = await extractTopKeywords(page);
+      }
+
+      // Strategy 3: Try inline script extraction if still no keywords
+      if (topKeywords.length === 0) {
+        logStep("SemrushDomain", "DOM scraping also yielded no keywords, trying inline script extraction...");
+        topKeywords = await extractKeywordsFromScripts(page);
+      }
+
+      // ── Comprehensive debug dump when keywords = 0 ──
+      if (topKeywords.length === 0) {
+        logStep("SemrushDomain", "=== KEYWORD EXTRACTION DEBUG DUMP (0 keywords found) ===");
+
+        // Dump captured API URLs and their structure
+        logStep("SemrushDomain", `Captured API responses: ${capturedApiData.length}`);
+        for (let i = 0; i < Math.min(capturedApiData.length, 10); i++) {
+          const apiResp = capturedApiData[i];
+          const bodyPreview = JSON.stringify(apiResp.body).substring(0, 500);
+          logStep("SemrushDomain", `  API[${i}] URL: ${apiResp.url.substring(0, 150)}`);
+          logStep("SemrushDomain", `  API[${i}] Body (first 500): ${bodyPreview}`);
+        }
+        if (capturedApiData.length === 0) {
+          logStep("SemrushDomain", "  No API responses were captured at all — proxy may use SSR instead of API calls");
+        }
+
+        // Dump table HTML
+        try {
+          const tableHtml = await page.evaluate(() => {
+            const tables = document.querySelectorAll('table');
+            if (tables.length > 0) return tables[0].outerHTML.substring(0, 2000);
+            const divTables = document.querySelectorAll('[class*="table"], [class*="Table"], [role="table"]');
+            if (divTables.length > 0) return divTables[0].outerHTML.substring(0, 2000);
+            return 'NO TABLE FOUND';
+          });
+          logStep("SemrushDomain", `Table HTML (first 2000): ${tableHtml}`);
+        } catch {}
+
+        // Dump page body text
+        try {
+          const bodyText = await page.locator('body').innerText().catch(() => "");
+          logStep("SemrushDomain", `Page body text (first 500): ${bodyText.substring(0, 500)}`);
+        } catch {}
+
+        // Dump page URL and title
+        logStep("SemrushDomain", `Current page URL: ${page.url()}`);
+        logStep("SemrushDomain", `Current page title: ${await page.title().catch(() => "")}`);
+
+        // Check for inline scripts containing keyword data
+        try {
+          const scriptSummary = await page.evaluate(() => {
+            const scripts = document.querySelectorAll('script');
+            const summary: string[] = [];
+            for (const script of scripts) {
+              const content = script.textContent || '';
+              if (content.includes('Ph') || content.includes('keyword') || content.includes('position') || content.includes('organic')) {
+                summary.push(`Script (len=${content.length}, has_Ph=${content.includes('"Ph"')}, has_keyword=${content.includes('keyword')}, has_position=${content.includes('position')}): ${content.substring(0, 200)}`);
+              }
+            }
+            return summary;
+          });
+          logStep("SemrushDomain", `Relevant inline scripts: ${scriptSummary.length}`);
+          for (const s of scriptSummary.slice(0, 5)) {
+            logStep("SemrushDomain", `  ${s}`);
+          }
+        } catch {}
+
+        logStep("SemrushDomain", "=== END DEBUG DUMP ===");
       }
     } else {
       logStep("SemrushDomain", "Could not load positions page, skipping keyword extraction");
