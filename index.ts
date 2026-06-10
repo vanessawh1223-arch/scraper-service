@@ -363,7 +363,7 @@ async function semrushLogin(
     logStep("SEMrush-Login", "Gateway nav warning:", navError instanceof Error ? navError.message : String(navError));
   }
 
-  await gatewayPage.waitForTimeout(5000);
+  await gatewayPage.waitForTimeout(2000);
 
   // Poll for redirect — the gateway auto-tests nodes and redirects after ~3s
   // But sometimes it needs a click to trigger the redirect
@@ -386,8 +386,8 @@ async function semrushLogin(
         break;
       }
 
-      // After 15 seconds, try clicking on node cards/buttons to trigger redirect
-      if (!clickAttempted && Date.now() - startTime > 15000) {
+      // After 10 seconds, try clicking on node cards/buttons to trigger redirect
+      if (!clickAttempted && Date.now() - startTime > 10000) {
         clickAttempted = true;
         logStep("SEMrush-Login", "Auto-redirect not happening, trying to click node...");
         try {
@@ -396,7 +396,7 @@ async function semrushLogin(
           if ((await clickable.count()) > 0 && (await clickable.isVisible())) {
             await clickable.click();
             logStep("SEMrush-Login", "Clicked first node card");
-            await gatewayPage.waitForTimeout(5000);
+            await gatewayPage.waitForTimeout(3000);
             continue;
           }
         } catch {}
@@ -407,7 +407,7 @@ async function semrushLogin(
           if ((await redirectLink.count()) > 0 && (await redirectLink.isVisible())) {
             await redirectLink.click();
             logStep("SEMrush-Login", "Clicked redirect link");
-            await gatewayPage.waitForTimeout(5000);
+            await gatewayPage.waitForTimeout(3000);
             continue;
           }
         } catch {}
@@ -478,7 +478,7 @@ async function semrushLogin(
   }
 
   // Wait for login to complete
-  await gatewayPage.waitForTimeout(5000);
+  await gatewayPage.waitForTimeout(3000);
   await gatewayPage.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
 
   const postLoginTitle = await gatewayPage.title().catch(() => "");
@@ -518,12 +518,12 @@ async function semrushLogin(
   if (newPage) {
     // Wait for the new page to load
     await newPage.waitForLoadState("domcontentloaded", { timeout: 30000 }).catch(() => {});
-    await newPage.waitForTimeout(5000);
+    await newPage.waitForTimeout(2000);
 
     // Wait for URL to stabilize (the new tab might redirect several times)
     let stableUrl = newPage.url();
-    for (let attempt = 0; attempt < 5; attempt++) {
-      await newPage.waitForTimeout(3000);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await newPage.waitForTimeout(1500);
       const currentUrl = newPage.url();
       if (currentUrl === stableUrl && !isChromeError(currentUrl) && currentUrl !== "about:blank") {
         break;
@@ -576,7 +576,7 @@ async function semrushLogin(
       const fullUrl = semrushHref.startsWith("http") ? semrushHref : new URL(semrushHref, gatewayPage.url()).href;
       logStep("SEMrush-Login", "Navigating gateway page to:", fullUrl);
       await gatewayPage.goto(fullUrl, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
-      await gatewayPage.waitForTimeout(5000);
+      await gatewayPage.waitForTimeout(3000);
     }
 
     // Use the gateway page as the SEMrush page
@@ -925,6 +925,71 @@ async function extractTopKeywords(page: Page, maxPages: number = 10): Promise<To
     await page.waitForSelector("table, .table, [data-at='positions-table']", { timeout: 10000 });
   } catch {}
 
+  // ── Parse table header to determine column indices ──
+  // SEMrush column short codes (in table header or data-at attributes):
+  //   Ph = Keyword/Phrase, Po = Position, Pp = Previous Position,
+  //   Sv = Search Volume, Tr = Traffic %, Tr_ = Traffic (absolute),
+  //   Ur = URL, Cp = Cost per click, Co = Competition, Nr = Number of results
+  let keywordCol = 0;   // default: first column
+  let positionCol = 1;  // default: second column
+  let trafficCol = -1;  // -1 means not found yet
+
+  try {
+    // Try to read header cells to identify columns
+    const headerCells = await page.locator("table thead th, .table__header th, [data-at='positions-table'] th").all();
+    if (headerCells.length > 0) {
+      for (let i = 0; i < headerCells.length; i++) {
+        const headerText = (await headerCells[i].textContent())?.trim().toLowerCase() || "";
+        const dataAt = await headerCells[i].getAttribute("data-at") || "";
+        const ariaLabel = await headerCells[i].getAttribute("aria-label") || "";
+
+        const allText = `${headerText} ${dataAt} ${ariaLabel}`.toLowerCase();
+
+        if (allText.includes("keyword") || allText.includes("phrase") || allText === "ph" || dataAt.includes("phrase")) {
+          keywordCol = i;
+        } else if (allText.includes("position") || allText === "po" || allText.includes("pos") || dataAt.includes("position")) {
+          // Make sure it's "position" not "previous position"
+          if (!allText.includes("previous") && !allText.includes("prev") && !allText.includes("pp")) {
+            positionCol = i;
+          }
+        } else if (allText.includes("traffic") || allText === "tr" || dataAt.includes("traffic")) {
+          if (!allText.includes("traffic%") && !allText.includes("traffic percent")) {
+            trafficCol = i;
+          }
+        } else if (allText.includes("volume") || allText === "sv" || allText.includes("search volume") || dataAt.includes("volume")) {
+          // Use search volume as traffic if traffic column not found
+          if (trafficCol === -1) trafficCol = i;
+        }
+      }
+      logStep("TopKeywords", `Column mapping: keyword=${keywordCol}, position=${positionCol}, traffic=${trafficCol} (from ${headerCells.length} headers)`);
+    }
+  } catch (err) {
+    logStep("TopKeywords", `Could not parse table headers: ${err}`);
+  }
+
+  // If we couldn't find a traffic column, try common SEMrush layouts:
+  // Layout 1: Keyword(0), Position(1), Prev Position(2), Search Volume(3), Traffic%(4)
+  // Layout 2: Keyword(0), Position(1), Search Volume(2), Traffic%(3)
+  if (trafficCol === -1) {
+    // Try to determine by examining the first row's cell count and content
+    try {
+      const firstRow = await page.locator("table tbody tr, .table__row").first();
+      const cells = await firstRow.locator("td, .table__cell").all();
+      if (cells.length >= 5) {
+        // Likely layout 1: Keyword, Position, Prev Pos, Volume, Traffic
+        trafficCol = 3; // Search Volume
+        logStep("TopKeywords", `Fallback: 5+ columns detected, using col 3 (Search Volume) for traffic`);
+      } else if (cells.length >= 3) {
+        // Likely layout 2: Keyword, Position, Volume
+        trafficCol = 2;
+        logStep("TopKeywords", `Fallback: 3 columns detected, using col 2 for traffic`);
+      }
+    } catch {}
+  }
+
+  // If still not found, default to column 2
+  if (trafficCol === -1) trafficCol = 2;
+
   for (let pageNum = 0; pageNum < maxPages; pageNum++) {
     const rows = await page.locator("table tbody tr, .table__row").all();
     let foundNonPosition1 = false;
@@ -935,16 +1000,21 @@ async function extractTopKeywords(page: Page, maxPages: number = 10): Promise<To
       try {
         const row = rows[i];
         const cells = await row.locator("td, .table__cell").all();
-        if (cells.length >= 3) {
-          const keywordText = (await cells[0].textContent())?.trim() || "";
-          const positionText = (await cells[1].textContent())?.trim() || "";
-          const trafficText = (await cells[2].textContent())?.trim() || "";
+        if (cells.length > Math.max(keywordCol, positionCol, trafficCol)) {
+          const keywordText = (await cells[keywordCol].textContent())?.trim() || "";
+          const positionText = (await cells[positionCol].textContent())?.trim() || "";
+          const trafficText = (await cells[trafficCol].textContent())?.trim() || "";
           const position = parseInt(positionText, 10);
+
+          // Debug first few rows on first page
+          if (pageNum === 0 && i < 3) {
+            logStep("TopKeywords", `Row ${i}: keyword="${keywordText.substring(0,30)}", pos="${positionText}", traffic="${trafficText}" (cols: ${cells.length})`);
+          }
+
           if (position === 1 && keywordText) {
             topKeywords.push({ keyword: keywordText, traffic: formatNumber(trafficText), position: 1 });
             pageKeywordCount++;
           } else if (position > 1) {
-            // If we encounter a non-position-1 keyword, note it
             foundNonPosition1 = true;
           }
         }
@@ -953,8 +1023,6 @@ async function extractTopKeywords(page: Page, maxPages: number = 10): Promise<To
 
     logStep("TopKeywords", `Page ${pageNum + 1}: found ${pageKeywordCount} position-1 keywords, total=${topKeywords.length}`);
 
-    // If we found non-position-1 keywords on this page, no need to paginate further
-    // (keywords are sorted by position ascending, so once we see position > 1, we're done)
     if (foundNonPosition1 || topKeywords.length >= MAX_KEYWORDS) {
       break;
     }
@@ -968,7 +1036,7 @@ async function extractTopKeywords(page: Page, maxPages: number = 10): Promise<To
         break;
       }
       await nextButton.click();
-      await page.waitForTimeout(2000); // Wait for new data to load
+      await page.waitForTimeout(1500); // Reduced from 2000ms
       try {
         await page.waitForSelector("table, .table, [data-at='positions-table']", { timeout: 8000 });
       } catch {
@@ -988,8 +1056,8 @@ async function extractTopKeywords(page: Page, maxPages: number = 10): Promise<To
 /**
  * Try to extract top keywords from captured SEMrush API responses.
  * SEMrush API typically returns keyword data with fields like:
- *   Ph = keyword phrase, Po = position, Tr = traffic
- * This is more reliable than DOM scraping when API responses are available.
+ *   Ph = keyword phrase, Po = position, Tr = traffic (percentage), Sv = search volume
+ * Also tries to parse the full API response body as a structured object.
  */
 function extractKeywordsFromApiData(capturedApiData: { url: string; body: any }[]): TopKeyword[] {
   const topKeywords: TopKeyword[] = [];
@@ -998,21 +1066,68 @@ function extractKeywordsFromApiData(capturedApiData: { url: string; body: any }[
 
   for (const apiResponse of capturedApiData) {
     try {
-      // Only look at responses that might contain position/keyword data
       const url = apiResponse.url;
       if (!url.includes('organic') && !url.includes('positions') && !url.includes('analytics')) continue;
 
-      const bodyStr = JSON.stringify(apiResponse.body);
+      const body = apiResponse.body;
+      const bodyStr = JSON.stringify(body);
 
-      // Try to find keyword data arrays in the API response
-      // SEMrush API format: data arrays with Ph (phrase), Po (position), Tr (traffic) fields
-      const dataMatch = bodyStr.match(/"data"\s*:\s*\[([\s\S]*?)\]/);
-      if (!dataMatch) continue;
+      // ── Strategy 1: Try structured parsing of the API response ──
+      // SEMrush API responses often have a top-level array or nested "data" arrays
+      const tryParseEntries = (entries: any[]) => {
+        for (const entry of entries) {
+          if (topKeywords.length >= MAX_KEYWORDS) break;
+          if (!entry || typeof entry !== 'object') continue;
 
-      // Parse individual entries looking for Ph/Po/Tr pattern
-      const entryPattern = /\{[^{}]*"Ph"\s*:\s*"([^"]+)"[^{}]*"Po"\s*:\s*(\d+)[^{}]*"Tr"\s*:\s*([\d,.]+)/g;
+          const keyword = entry.Ph || entry.Keyword || entry.keyword || entry.keyword_phrase || "";
+          const position = parseInt(entry.Po || entry.Position || entry.position || entry.pos || "0", 10);
+          // Traffic can be Tr (traffic %), Sv (search volume), or Tc (traffic cost)
+          const trafficRaw = entry.Sv || entry.Tr || entry.Tc || entry.volume || entry.traffic || entry.Traffic || "0";
+          const traffic = typeof trafficRaw === 'number' ? trafficRaw : formatNumber(String(trafficRaw));
+
+          if (position === 1 && keyword && !seenKeywords.has(keyword.toLowerCase())) {
+            seenKeywords.add(keyword.toLowerCase());
+            topKeywords.push({ keyword, traffic, position: 1 });
+          }
+        }
+      };
+
+      // Try if body itself is an array
+      if (Array.isArray(body)) {
+        tryParseEntries(body);
+      }
+
+      // Try nested data arrays
+      const tryNested = (obj: any, depth = 0) => {
+        if (depth > 3 || topKeywords.length >= MAX_KEYWORDS) return;
+        if (!obj || typeof obj !== 'object') return;
+        if (Array.isArray(obj)) {
+          tryParseEntries(obj);
+          return;
+        }
+        for (const key of Object.keys(obj)) {
+          if (key === 'data' || key === 'results' || key === 'rows') {
+            if (Array.isArray(obj[key])) {
+              tryParseEntries(obj[key]);
+            }
+          }
+          if (typeof obj[key] === 'object' && obj[key] !== null) {
+            tryNested(obj[key], depth + 1);
+          }
+        }
+      };
+
+      if (typeof body === 'object' && !Array.isArray(body)) {
+        tryNested(body);
+      }
+
+      if (topKeywords.length >= MAX_KEYWORDS) break;
+
+      // ── Strategy 2: Regex-based parsing for stringified API responses ──
+      // Pattern 1: Ph/Po/Sv (most common in SEMrush API - Sv = search volume)
+      const svPattern = /\{[^{}]*"Ph"\s*:\s*"([^"]+)"[^{}]*"Po"\s*:\s*(\d+)[^{}]*"Sv"\s*:\s*([\d,.]+)/g;
       let match;
-      while ((match = entryPattern.exec(bodyStr)) !== null && topKeywords.length < MAX_KEYWORDS) {
+      while ((match = svPattern.exec(bodyStr)) !== null && topKeywords.length < MAX_KEYWORDS) {
         const keyword = match[1];
         const position = parseInt(match[2], 10);
         const traffic = formatNumber(match[3]);
@@ -1022,9 +1137,9 @@ function extractKeywordsFromApiData(capturedApiData: { url: string; body: any }[
         }
       }
 
-      // Alternative format: "Keyword"/"keyword"/"Ph" with different field names
-      const altPattern = /\{[^{}]*"(?:Ph|Keyword|keyword|keyword_phrase)"\s*:\s*"([^"]+)"[^{}]*"(?:Po|Position|position|pos)"\s*:\s*(\d+)[^{}]*"(?:Tr|Traffic|traffic|volume)"\s*:\s*([\d,.]+)/g;
-      while ((match = altPattern.exec(bodyStr)) !== null && topKeywords.length < MAX_KEYWORDS) {
+      // Pattern 2: Ph/Po/Tr (Tr = traffic percentage)
+      const trPattern = /\{[^{}]*"Ph"\s*:\s*"([^"]+)"[^{}]*"Po"\s*:\s*(\d+)[^{}]*"Tr"\s*:\s*([\d,.]+)/g;
+      while ((match = trPattern.exec(bodyStr)) !== null && topKeywords.length < MAX_KEYWORDS) {
         const keyword = match[1];
         const position = parseInt(match[2], 10);
         const traffic = formatNumber(match[3]);
@@ -1038,6 +1153,8 @@ function extractKeywordsFromApiData(capturedApiData: { url: string; body: any }[
 
   if (topKeywords.length > 0) {
     logStep("TopKeywords-API", `Extracted ${topKeywords.length} position-1 keywords from API data`);
+  } else {
+    logStep("TopKeywords-API", `No keywords found in ${capturedApiData.length} API responses`);
   }
   return topKeywords;
 }
@@ -1062,7 +1179,7 @@ async function navigateToSemrushPage(
       logStep("Navigate", "Page loaded, URL:", page.url());
 
       // Wait for the page to settle (proxy pages can be slow)
-      await page.waitForTimeout(10000);
+      await page.waitForTimeout(5000);
       try { await page.waitForLoadState("networkidle", { timeout: 20000 }); } catch {}
 
       const pageTitle = await page.title().catch(() => "");
@@ -1083,7 +1200,7 @@ async function navigateToSemrushPage(
       }
 
       logStep("Navigate", "Page appears empty, waiting more...");
-      await page.waitForTimeout(5000);
+      await page.waitForTimeout(3000);
       return true;  // Return true anyway, let extraction handle empty pages
     } catch (err) {
       logStep("Navigate", `Attempt ${attempt} failed:`, err instanceof Error ? err.message : String(err));
@@ -1230,8 +1347,8 @@ async function handleSemrushDomain(req: Request): Promise<Response> {
     let positionsOk = false;
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        await page.goto(positionsUrl, { waitUntil: "load", timeout: 90000 });
-        await page.waitForTimeout(10000);
+        await page.goto(positionsUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+        await page.waitForTimeout(3000);
         try { await page.waitForLoadState("networkidle", { timeout: 20000 }); } catch {}
         const pageTitle = await page.title().catch(() => "");
         const currentUrl = page.url();
@@ -1246,7 +1363,7 @@ async function handleSemrushDomain(req: Request): Promise<Response> {
       }
     }
     if (positionsOk) {
-      await page.waitForTimeout(3000);
+      await page.waitForTimeout(2000);
       // Try API extraction first (more reliable)
       topKeywords = extractKeywordsFromApiData(capturedApiData);
       if (topKeywords.length > 0) {
@@ -1328,7 +1445,7 @@ async function handleSemrushAds(req: Request): Promise<Response> {
     logStep("SemrushAds", "Step 2: Navigating to ad copies...");
     const adCopiesUrl = `${semrushBaseUrl}/advertising/copies/?q=${encodeURIComponent(domain)}&db=${countryDb}&display_type=text`;
     await page.goto(adCopiesUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await page.waitForTimeout(8000);
+    await page.waitForTimeout(5000);
 
     try {
       await page.waitForSelector("table, .table, [data-at='ad-copies-table'], .ad-copy", { timeout: 15000 });
