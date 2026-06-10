@@ -27,6 +27,13 @@ interface SemrushAdsRequest {
   password: string;
 }
 
+interface SemrushBatchRequest {
+  domains: Array<{ domain: string; country?: string }>;
+  loginUrl: string;
+  cardNumber: string;
+  password: string;
+}
+
 interface TopKeyword {
   keyword: string;
   traffic: number;
@@ -1216,6 +1223,107 @@ async function navigateToSemrushPage(
 }
 
 // ---------------------------------------------------------------------------
+// Batch Query Helper — Queries a single domain using an already-logged-in page
+// ---------------------------------------------------------------------------
+
+async function querySingleDomain(
+  page: Page,
+  semrushBaseUrl: string,
+  domain: string,
+  country: string
+): Promise<{
+  success: boolean;
+  domain: string;
+  country: string;
+  isSubdomain: boolean;
+  organicTraffic: number;
+  paidTraffic: number;
+  topKeywords: TopKeyword[];
+  rootDomainData: { domain: string; organicTraffic: number; paidTraffic: number } | null;
+  error?: string;
+}> {
+  const countryDb = country.toUpperCase();
+  logStep("BatchQuery", `Querying domain: ${domain} (${countryDb})`);
+
+  try {
+    // Clear previous API captures by setting up fresh interceptor
+    const capturedApiData: { url: string; body: any }[] = [];
+    const responseListener = async (response: any) => {
+      try {
+        const url = response.url();
+        if (url.includes('/analytics/') || url.includes('/api/') || url.includes('overview') || url.includes('organic') || url.includes('adwords') || url.includes('paid')) {
+          const contentType = response.headers()['content-type'] || '';
+          if (contentType.includes('json')) {
+            const jsonBody = await response.json().catch(() => null);
+            if (jsonBody) capturedApiData.push({ url, body: jsonBody });
+          }
+        }
+      } catch {}
+    };
+    page.on('response', responseListener);
+
+    // Step 1: Navigate to domain overview
+    const overviewOk = await navigateToSemrushPage(page, semrushBaseUrl, "/analytics/overview/", domain, countryDb);
+    if (!overviewOk) {
+      page.off('response', responseListener);
+      return { success: false, domain, country: countryDb, isSubdomain: false, organicTraffic: 0, paidTraffic: 0, topKeywords: [], rootDomainData: null, error: "Failed to load domain overview page" };
+    }
+
+    // Step 2: Extract traffic from API data
+    let organicTraffic = 0;
+    let paidTraffic = 0;
+    for (const apiResponse of capturedApiData) {
+      try {
+        const bodyStr = JSON.stringify(apiResponse.body);
+        const organicMatch = bodyStr.match(/"organic[^"]*traffic[^"]*":\s*"?([\d,.]+[KMB]?)"?/i) || bodyStr.match(/"organic_search_traffic[^"]*":\s*(\d+)/i) || bodyStr.match(/"Ot[^"]*":\s*(\d+)/i);
+        if (organicMatch) { const val = formatNumber(organicMatch[1]); if (val > organicTraffic) organicTraffic = val; }
+        const paidMatch = bodyStr.match(/"paid[^"]*traffic[^"]*":\s*"?([\d,.]+[KMB]?)"?/i) || bodyStr.match(/"adwords[^"]*traffic[^"]*":\s*(\d+)/i) || bodyStr.match(/"Ad[^"]*":\s*(\d+)/i) || bodyStr.match(/"paid_search_traffic[^"]*":\s*(\d+)/i);
+        if (paidMatch) { const val = formatNumber(paidMatch[1]); if (val > paidTraffic) paidTraffic = val; }
+      } catch {}
+    }
+
+    if (organicTraffic === 0) organicTraffic = await extractOrganicTraffic(page);
+    if (paidTraffic === 0) paidTraffic = await extractPaidTraffic(page);
+
+    // Step 3: Extract top keywords
+    let topKeywords: TopKeyword[] = [];
+    const positionsUrl = `${semrushBaseUrl}/analytics/organic/positions/?q=${encodeURIComponent(domain)}&db=${countryDb}&display_sort=pos_num&display_direction=asc`;
+    let positionsOk = false;
+    try {
+      await page.goto(positionsUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await page.waitForTimeout(3000);
+      try { await page.waitForLoadState("networkidle", { timeout: 20000 }); } catch {}
+      positionsOk = true;
+    } catch {}
+    
+    if (positionsOk) {
+      await page.waitForTimeout(2000);
+      topKeywords = extractKeywordsFromApiData(capturedApiData);
+      if (topKeywords.length === 0) topKeywords = await extractTopKeywords(page);
+    }
+
+    // Step 4: Root domain data for subdomains
+    let rootDomainData: { domain: string; organicTraffic: number; paidTraffic: number } | null = null;
+    if (isSubdomain(domain)) {
+      const rootDomain = getRootDomain(domain);
+      const rootOk = await navigateToSemrushPage(page, semrushBaseUrl, "/analytics/overview/", rootDomain, countryDb);
+      if (rootOk) {
+        rootDomainData = { domain: rootDomain, organicTraffic: await extractOrganicTraffic(page), paidTraffic: await extractPaidTraffic(page) };
+      }
+    }
+
+    page.off('response', responseListener);
+
+    logStep("BatchQuery", `Completed: ${domain} organic=${organicTraffic}, paid=${paidTraffic}, keywords=${topKeywords.length}`);
+    return { success: true, domain, country: countryDb, isSubdomain: isSubdomain(domain), organicTraffic, paidTraffic, topKeywords, rootDomainData };
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logStep("BatchQuery", `FAILED: ${domain} - ${errMsg}`);
+    return { success: false, domain, country: countryDb, isSubdomain: false, organicTraffic: 0, paidTraffic: 0, topKeywords: [], rootDomainData: null, error: errMsg };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Endpoint: POST /api/semrush/domain
 // ---------------------------------------------------------------------------
 
@@ -1530,6 +1638,94 @@ async function handleSemrushAds(req: Request): Promise<Response> {
 }
 
 // ---------------------------------------------------------------------------
+// Endpoint: POST /api/semrush/batch (NDJSON streaming)
+// ---------------------------------------------------------------------------
+
+async function handleSemrushBatch(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  let body: SemrushBatchRequest;
+  try {
+    const rawBody = await new Promise<string>((resolve) => {
+      let data = "";
+      req.on("data", (chunk) => { data += chunk; });
+      req.on("end", () => { resolve(data); });
+    });
+    body = JSON.parse(rawBody) as SemrushBatchRequest;
+  } catch {
+    res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+    res.end(JSON.stringify({ success: false, error: "Invalid JSON body" }));
+    return;
+  }
+
+  const { domains, loginUrl, cardNumber, password } = body;
+  if (!domains || !Array.isArray(domains) || domains.length === 0 || !loginUrl || !cardNumber || !password) {
+    res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+    res.end(JSON.stringify({ success: false, error: "domains (non-empty array), loginUrl, cardNumber, and password are required" }));
+    return;
+  }
+
+  // Set up NDJSON streaming response
+  res.writeHead(200, {
+    "Content-Type": "application/x-ndjson",
+    "Transfer-Encoding": "chunked",
+    "Access-Control-Allow-Origin": "*",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+  });
+
+  const sendLine = (data: object) => {
+    res.write(JSON.stringify(data) + "\n");
+  };
+
+  let browser: Browser | null = null;
+
+  try {
+    // Step 1: Login ONCE
+    const { browser: launchedBrowser, context } = await launchSemrushBrowser();
+    browser = launchedBrowser;
+
+    logStep("SemrushBatch", `Logging in for batch of ${domains.length} domains...`);
+    sendLine({ type: "progress", step: "login", message: "Logging in to SEMrush..." });
+
+    const { page, semrushBaseUrl } = await semrushLogin(context, loginUrl, cardNumber, password);
+    logStep("SemrushBatch", `Login successful, base URL: ${semrushBaseUrl}`);
+
+    sendLine({ type: "progress", step: "login_complete", message: "Login successful" });
+
+    // Step 2: Query each domain in sequence, reusing the same page
+    let completed = 0;
+    let succeeded = 0;
+    for (const item of domains) {
+      const domain = item.domain;
+      const country = item.country || "US";
+
+      sendLine({ type: "progress", step: "querying", domain, completed, total: domains.length, message: `Querying ${domain}...` });
+
+      const result = await querySingleDomain(page, semrushBaseUrl, domain, country);
+      completed++;
+      if (result.success) succeeded++;
+
+      sendLine({ type: "result", ...result, completed, total: domains.length });
+
+      // Brief pause between domains to avoid rate limiting
+      if (completed < domains.length) {
+        await page.waitForTimeout(1000);
+      }
+    }
+
+    sendLine({ type: "complete", total: domains.length, succeeded, failed: domains.length - succeeded });
+
+    await closeBrowser(browser);
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logStep("SemrushBatch", `FAILED: ${errMsg}`);
+    sendLine({ type: "error", error: errMsg });
+    if (browser) await closeBrowser(browser);
+  }
+
+  res.end();
+}
+
+// ---------------------------------------------------------------------------
 // HTTP Server
 // ---------------------------------------------------------------------------
 
@@ -1592,6 +1788,9 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
         const response = await handleSemrushDomain(request);
         const body = await response.text();
         sendJson(JSON.parse(body), response.status);
+      } else if (url.pathname === "/api/semrush/batch" && req.method === "POST") {
+        await handleSemrushBatch(req, res);
+        return; // Already handled response directly
       } else if (url.pathname === "/api/semrush/ads" && req.method === "POST") {
         const request = await makeRequest();
         const response = await handleSemrushAds(request);
