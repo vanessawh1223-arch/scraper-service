@@ -1,4 +1,5 @@
 import { chromium, type Browser, type BrowserContext, type Page, type Route } from "playwright";
+import { createServer, IncomingMessage, ServerResponse } from "http";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1294,33 +1295,77 @@ async function handleSemrushAds(req: Request): Promise<Response> {
 
 const PORT = 3001;
 
-const server = Bun.serve({
-  port: PORT,
-  async fetch(req) {
-    const url = new URL(req.url);
+const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    const url = new URL(req.url || "/", `http://localhost:${PORT}`);
 
+    // Handle CORS preflight
     if (req.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type" },
+      res.writeHead(204, {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
       });
+      res.end();
+      return;
     }
 
-    if (url.pathname === "/health" && req.method === "GET") {
-      return jsonResponse({ status: "ok", timestamp: Date.now() });
-    }
-    if (url.pathname === "/api/extract" && req.method === "POST") {
-      return handleExtract(req);
-    }
-    if (url.pathname === "/api/semrush/domain" && req.method === "POST") {
-      return handleSemrushDomain(req);
-    }
-    if (url.pathname === "/api/semrush/ads" && req.method === "POST") {
-      return handleSemrushAds(req);
-    }
+    // Helper to read request body
+    const readBody = (): Promise<string> => {
+      return new Promise((resolve) => {
+        let body = "";
+        req.on("data", (chunk) => { body += chunk; });
+        req.on("end", () => { resolve(body); });
+      });
+    };
 
-    return jsonResponse({ error: "Not found" }, 404);
-  },
+    // Helper to send JSON response
+    const sendJson = (data: unknown, status = 200) => {
+      res.writeHead(status, {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+      });
+      res.end(JSON.stringify(data));
+    };
+
+    // Create a Request-like object for handlers
+    const makeRequest = async (): Promise<Request> => {
+      const body = await readBody();
+      return new Request(`http://localhost:${PORT}${req.url}`, {
+        method: req.method,
+        headers: req.headers as Record<string, string>,
+        body: body || undefined,
+      });
+    };
+
+    try {
+      if (url.pathname === "/health" && req.method === "GET") {
+        sendJson({ status: "ok", timestamp: Date.now() });
+      } else if (url.pathname === "/api/extract" && req.method === "POST") {
+        const request = await makeRequest();
+        const response = await handleExtract(request);
+        const body = await response.text();
+        sendJson(JSON.parse(body), response.status);
+      } else if (url.pathname === "/api/semrush/domain" && req.method === "POST") {
+        const request = await makeRequest();
+        const response = await handleSemrushDomain(request);
+        const body = await response.text();
+        sendJson(JSON.parse(body), response.status);
+      } else if (url.pathname === "/api/semrush/ads" && req.method === "POST") {
+        const request = await makeRequest();
+        const response = await handleSemrushAds(request);
+        const body = await response.text();
+        sendJson(JSON.parse(body), response.status);
+      } else {
+        sendJson({ error: "Not found" }, 404);
+      }
+    } catch (err) {
+      console.error("Request handler error:", err);
+      sendJson({ error: "Internal server error" }, 500);
+    }
+  });
+
+server.listen(PORT, () => {
+  console.log(`Scraper service running on port ${PORT}`);
 });
-
-console.log(`Scraper service running on port ${PORT}`);
