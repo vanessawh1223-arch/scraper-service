@@ -344,7 +344,217 @@ async function handleExtract(req: Request): Promise<Response> {
 }
 
 // ---------------------------------------------------------------------------
-// SEMrush Login Helper — Three-phase login flow:
+// SEMrush Direct Login — for users with direct SEMrush accounts
+// Navigates to semrush.com/login, enters email + password, waits for dashboard
+// ---------------------------------------------------------------------------
+
+async function semrushDirectLogin(
+  context: BrowserContext,
+  loginUrl: string,
+  cardNumber: string,
+  password: string
+): Promise<{ page: Page; semrushBaseUrl: string }> {
+  logStep("SEMrush-DirectLogin", "Starting direct SEMrush login, loginUrl:", loginUrl);
+
+  const page = await context.newPage();
+
+  // Navigate to login page
+  try {
+    logStep("SEMrush-DirectLogin", "Navigating to login page...");
+    await page.goto(loginUrl, { waitUntil: "load", timeout: 60000 });
+    logStep("SEMrush-DirectLogin", "Login page loaded, URL:", page.url());
+  } catch (navError) {
+    logStep("SEMrush-DirectLogin", "Navigation warning:", navError instanceof Error ? navError.message : String(navError));
+  }
+
+  await page.waitForTimeout(2000);
+
+  // Handle cookie consent if present
+  try {
+    const cookieBtn = page.locator('button:has-text("Accept"), button:has-text("接受"), button:has-text("I agree"), button:has-text("同意"), #onetrust-accept-btn-handler, [id*="accept"]').first();
+    if ((await cookieBtn.count()) > 0 && (await cookieBtn.isVisible().catch(() => false))) {
+      await cookieBtn.click();
+      logStep("SEMrush-DirectLogin", "Dismissed cookie consent");
+      await page.waitForTimeout(1000);
+    }
+  } catch {}
+
+  // Check if we're already logged in (redirected to dashboard)
+  const currentUrl = page.url();
+  if (!currentUrl.includes("login") && !currentUrl.includes("signup")) {
+    logStep("SEmrush-DirectLogin", "Already logged in, current URL:", currentUrl);
+    const semrushBaseUrl = new URL(currentUrl).protocol + "//" + new URL(currentUrl).host;
+    return { page, semrushBaseUrl };
+  }
+
+  // Fill email - the cardNumber field is used as email for direct login
+  logStep("SEMrush-DirectLogin", "Filling email...");
+  const emailSelectors = [
+    'input[name="email"]',
+    'input[type="email"]',
+    'input[placeholder*="email" i]',
+    'input[placeholder*="Email" i]',
+    'input[id*="email" i]',
+    'input[autocomplete="email"]',
+    'input[type="text"]:first-of-type',
+  ];
+
+  let emailFilled = false;
+  for (const selector of emailSelectors) {
+    try {
+      const el = page.locator(selector).first();
+      if ((await el.count()) > 0 && (await el.isVisible().catch(() => false))) {
+        await el.click();
+        await el.fill('');
+        await el.fill(cardNumber); // cardNumber = email for direct login
+        emailFilled = true;
+        logStep("SEMrush-DirectLogin", "Filled email with selector:", selector);
+        break;
+      }
+    } catch {}
+  }
+
+  if (!emailFilled) {
+    // Fallback: try any visible text input on the page
+    try {
+      const inputs = await page.locator('input[type="text"]:not([type="hidden"]), input:not([type])').all();
+      for (const input of inputs) {
+        if (await input.isVisible().catch(() => false)) {
+          await input.click();
+          await input.fill('');
+          await input.fill(cardNumber);
+          emailFilled = true;
+          logStep("SEMrush-DirectLogin", "Filled email via fallback input");
+          break;
+        }
+      }
+    } catch {}
+  }
+
+  if (!emailFilled) {
+    throw new Error("Could not find email input on SEMrush login page");
+  }
+
+  await page.waitForTimeout(500);
+
+  // Fill password
+  logStep("SEMrush-DirectLogin", "Filling password...");
+  let passwordFilled = false;
+  try {
+    const pwInput = page.locator('input[type="password"]').first();
+    if ((await pwInput.count()) > 0 && (await pwInput.isVisible().catch(() => false))) {
+      await pwInput.click();
+      await pwInput.fill('');
+      await pwInput.fill(password);
+      passwordFilled = true;
+      logStep("SEMrush-DirectLogin", "Filled password");
+    }
+  } catch {}
+
+  if (!passwordFilled) {
+    // SEMrush might have a 2-step login: email first, then password on next page
+    logStep("SEMrush-DirectLogin", "No password field visible - might be 2-step login, clicking continue...");
+
+    // Click the continue/next button
+    const continueBtn = page.locator('button[type="submit"], button:has-text("Continue"), button:has-text("继续"), button:has-text("Next"), button:has-text("Log in"), button:has-text("登录")').first();
+    if ((await continueBtn.count()) > 0 && (await continueBtn.isVisible().catch(() => false))) {
+      await continueBtn.click();
+      logStep("SEMrush-DirectLogin", "Clicked continue button");
+      await page.waitForTimeout(3000);
+
+      // Now look for password field
+      try {
+        const pwInput2 = page.locator('input[type="password"]').first();
+        if ((await pwInput2.count()) > 0 && (await pwInput2.isVisible().catch(() => false))) {
+          await pwInput2.click();
+          await pwInput2.fill('');
+          await pwInput2.fill(password);
+          passwordFilled = true;
+          logStep("SEMrush-DirectLogin", "Filled password (2-step login)");
+        }
+      } catch {}
+    }
+  }
+
+  // Click login/submit button
+  logStep("SEMrush-DirectLogin", "Clicking login button...");
+  const loginBtnSelectors = [
+    'button[type="submit"]',
+    'button:has-text("Log in")',
+    'button:has-text("Login")',
+    'button:has-text("Sign in")',
+    'button:has-text("登录")',
+    'button:has-text("Continue")',
+    'input[type="submit"]',
+  ];
+
+  let loginClicked = false;
+  for (const selector of loginBtnSelectors) {
+    try {
+      const btn = page.locator(selector).first();
+      if ((await btn.count()) > 0 && (await btn.isVisible().catch(() => false))) {
+        await btn.click();
+        loginClicked = true;
+        logStep("SEMrush-DirectLogin", "Clicked login button:", selector);
+        break;
+      }
+    } catch {}
+  }
+
+  if (!loginClicked) {
+    await page.keyboard.press("Enter");
+    logStep("SEMrush-DirectLogin", "Pressed Enter to submit");
+  }
+
+  // Wait for login to complete
+  logStep("SEMrush-DirectLogin", "Waiting for login to complete...");
+  await page.waitForTimeout(5000);
+
+  // Wait for navigation away from login page
+  try {
+    await page.waitForURL(
+      (url) => {
+        const urlStr = url.toString();
+        return !urlStr.includes("login") && !urlStr.includes("signup") && !urlStr.includes("auth");
+      },
+      { timeout: 30000 }
+    );
+  } catch {
+    // May have already navigated or may need more time
+    logStep("SEMrush-DirectLogin", "Login redirect timeout, checking current URL...");
+  }
+
+  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+
+  const postLoginUrl = page.url();
+  logStep("SEMrush-DirectLogin", "Post-login URL:", postLoginUrl);
+
+  // Handle any post-login popups/modals
+  try {
+    const closeBtn = page.locator('button:has-text("Skip"), button:has-text("关闭"), button:has-text("Close"), button[aria-label="Close"], [class*="close"], [class*="dismiss"]').first();
+    if ((await closeBtn.count()) > 0 && (await closeBtn.isVisible().catch(() => false))) {
+      await closeBtn.click();
+      logStep("SEMrush-DirectLogin", "Closed post-login popup");
+      await page.waitForTimeout(1000);
+    }
+  } catch {}
+
+  // Determine base URL
+  const semrushBaseUrl = new URL(postLoginUrl).protocol + "//" + new URL(postLoginUrl).host;
+  logStep("SEMrush-DirectLogin", "SEMrush base URL:", semrushBaseUrl);
+
+  // Verify we're actually logged in by checking the page
+  const pageTitle = await page.title().catch(() => "");
+  if (pageTitle.includes("登录") || pageTitle.includes("Login") || pageTitle.includes("Sign in")) {
+    throw new Error("Direct SEMrush login failed - still on login page. Please check your credentials.");
+  }
+
+  return { page, semrushBaseUrl };
+}
+
+// ---------------------------------------------------------------------------
+// SEMrush Login Helper — Gateway proxy login flow:
 // Phase 1: Gateway page (gwt.tuanai.me) → auto-redirect to proxy dashboard
 // Phase 2: Proxy login page → click 账号密码 tab, fill credentials
 // Phase 3: Click "打开 Semrush" → opens new tab with SEMrush content
@@ -356,7 +566,15 @@ async function semrushLogin(
   cardNumber: string,
   password: string
 ): Promise<{ page: Page; semrushBaseUrl: string }> {
-  logStep("SEMrush-Login", "Starting 3-phase login flow, loginUrl:", loginUrl);
+  // Detect if this is a direct SEMrush login or a gateway proxy login
+  const isDirectLogin = loginUrl.includes("semrush.com");
+
+  if (isDirectLogin) {
+    logStep("SEMrush-Login", "Detected direct SEMrush login URL, using direct login flow");
+    return semrushDirectLogin(context, loginUrl, cardNumber, password);
+  }
+
+  logStep("SEMrush-Login", "Starting gateway proxy login flow, loginUrl:", loginUrl);
 
   const gatewayPage = await context.newPage();
   const loginHost = new URL(loginUrl).hostname;
