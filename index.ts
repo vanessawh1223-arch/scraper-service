@@ -598,7 +598,7 @@ async function semrushLogin(
 
   if (currentHost === loginHost) {
     logStep("SEMrush-Login", "Waiting for gateway auto-redirect...");
-    const maxWaitMs = 90000;
+    const maxWaitMs = 30000;  // Reduced from 90s — gateway should redirect quickly or not at all
     const startTime = Date.now();
     let clickAttempted = false;
 
@@ -611,13 +611,13 @@ async function semrushLogin(
         break;
       }
 
-      // After 10 seconds, try clicking on node cards/buttons to trigger redirect
-      if (!clickAttempted && Date.now() - startTime > 10000) {
+      // After 5 seconds, try clicking on node cards/buttons to trigger redirect
+      if (!clickAttempted && Date.now() - startTime > 5000) {
         clickAttempted = true;
         logStep("SEMrush-Login", "Auto-redirect not happening, trying to click node...");
         try {
           // The gateway page has clickable node cards for each proxy server
-          const clickable = gatewayPage.locator('.node-card, [class*="node"], a[href*="http"], [class*="card"]').first();
+          const clickable = gatewayPage.locator('.node-card, [class*="node"], a[href*="http"], [class*="card"], button').first();
           if ((await clickable.count()) > 0 && (await clickable.isVisible())) {
             await clickable.click();
             logStep("SEMrush-Login", "Clicked first node card");
@@ -636,9 +636,29 @@ async function semrushLogin(
             continue;
           }
         } catch {}
+
+        // Alternative: try clicking any visible link that leads to a different host
+        try {
+          const links = gatewayPage.locator('a[href]');
+          const linkCount = await links.count();
+          for (let i = 0; i < Math.min(linkCount, 10); i++) {
+            try {
+              const link = links.nth(i);
+              if (await link.isVisible()) {
+                const href = await link.getAttribute('href') || '';
+                if (href && !href.startsWith('#') && !href.startsWith('javascript')) {
+                  await link.click();
+                  logStep("SEMrush-Login", `Clicked link ${i}: ${href.substring(0, 80)}`);
+                  await gatewayPage.waitForTimeout(3000);
+                  break;
+                }
+              }
+            } catch {}
+          }
+        } catch {}
       }
 
-      await gatewayPage.waitForTimeout(3000);
+      await gatewayPage.waitForTimeout(2000);
     }
   }
 
@@ -654,7 +674,7 @@ async function semrushLogin(
   // Click the 账号密码 (Account/Password) tab
   logStep("SEMrush-Login", "Clicking 账号密码 tab...");
   try {
-    const accTab = gatewayPage.locator('text=账号密码').first();
+    const accTab = gatewayPage.locator('text=账号密码, [class*="tab"]:has-text("账号"), [role="tab"]:has-text("账号")').first();
     if ((await accTab.count()) > 0 && (await accTab.isVisible())) {
       await accTab.click();
       await gatewayPage.waitForTimeout(1000);
@@ -717,10 +737,10 @@ async function semrushLogin(
   let semrushBaseUrl = "";
 
   // Approach A: Click button that opens a new tab
-  const newPagePromise = context.waitForEvent('page', { timeout: 20000 }).catch(() => null);
+  const newPagePromise = context.waitForEvent('page', { timeout: 15000 }).catch(() => null);
 
   try {
-    const openBtn = gatewayPage.locator('text=打开 Semrush, text=打开 semrush, a:has-text("Semrush")').first();
+    const openBtn = gatewayPage.locator('text=打开 Semrush, text=打开 semrush, a:has-text("Semrush"), button:has-text("Semrush"), a:has-text("semrush"), [class*="semrush"]').first();
     if ((await openBtn.count()) > 0 && (await openBtn.isVisible())) {
       await openBtn.click();
       logStep("SEMrush-Login", "Clicked 打开 Semrush");
@@ -730,12 +750,25 @@ async function semrushLogin(
   } catch (e) {
     logStep("SEMrush-Login", "打开 Semrush button error:", e instanceof Error ? e.message : String(e));
     // Try alternative: look for any link/button that opens SEMrush
-    const altBtn = gatewayPage.locator('a[href*="semrush"], button:has-text("Semrush"), [class*="semrush"]').first();
-    if ((await altBtn.count()) > 0) {
-      await altBtn.click();
-      logStep("SEMrush-Login", "Clicked alternative Semrush button");
-    } else {
-      throw new Error("Could not find any Semrush launch button on proxy dashboard");
+    try {
+      const altBtn = gatewayPage.locator('a[href*="semrush"], button:has-text("Semrush"), a[href*="analytics"], [data-semrush]').first();
+      if ((await altBtn.count()) > 0) {
+        await altBtn.click();
+        logStep("SEMrush-Login", "Clicked alternative Semrush button");
+      } else {
+        // Try clicking any link that might be SEMrush-related from HTML
+        const html = await gatewayPage.content();
+        const hrefMatch = html.match(/href=["']([^"']*semrush[^"']*)["']/i);
+        if (hrefMatch) {
+          const fullUrl = hrefMatch[1].startsWith('http') ? hrefMatch[1] : new URL(hrefMatch[1], gatewayPage.url()).href;
+          logStep("SEMrush-Login", "Found SEMrush href in HTML, navigating to:", fullUrl);
+          await gatewayPage.goto(fullUrl, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+        } else {
+          throw new Error("Could not find any Semrush launch button on proxy dashboard");
+        }
+      }
+    } catch (e2) {
+      throw new Error(`Could not find any Semrush launch button: ${e2 instanceof Error ? e2.message : String(e2)}`);
     }
   }
 
@@ -2541,6 +2574,137 @@ async function handleSemrushBatch(req: IncomingMessage, res: ServerResponse): Pr
 }
 
 // ---------------------------------------------------------------------------
+// Endpoint: POST /api/semrush/debug — Diagnostic endpoint
+// ---------------------------------------------------------------------------
+
+async function handleSemrushDebug(req: Request): Promise<Response> {
+  let body: { loginUrl?: string; cardNumber?: string; password?: string };
+  try { body = (await req.json()) as typeof body; } catch { return jsonResponse({ success: false, error: "Invalid JSON body" }, 400); }
+
+  const { loginUrl, cardNumber, password } = body;
+  if (!loginUrl || !cardNumber || !password) {
+    return jsonResponse({ success: false, error: "loginUrl, cardNumber, and password are required" }, 400);
+  }
+
+  logStep("SemrushDebug", "Starting debug session...");
+  let browser: Browser | null = null;
+  const screenshots: { phase: string; url: string; title: string; screenshot: string; bodyText: string }[] = [];
+
+  try {
+    const { browser: launchedBrowser, context } = await launchSemrushBrowser();
+    browser = launchedBrowser;
+
+    const page = await context.newPage();
+
+    // Phase 1: Load gateway
+    logStep("SemrushDebug", "Phase 1: Loading gateway...");
+    try {
+      await page.goto(loginUrl, { waitUntil: "load", timeout: 30000 });
+    } catch (navErr) {
+      logStep("SemrushDebug", "Gateway nav error:", navErr instanceof Error ? navErr.message : String(navErr));
+    }
+    await page.waitForTimeout(3000);
+
+    const phase1Url = page.url();
+    const phase1Title = await page.title().catch(() => "");
+    const phase1Screenshot = (await page.screenshot({ type: "jpeg", quality: 50 }).catch(() => Buffer.alloc(0))).toString("base64");
+    const phase1Body = await page.locator('body').innerText().catch(() => "").then(t => t.substring(0, 500));
+    screenshots.push({ phase: "1-gateway-load", url: phase1Url, title: phase1Title, screenshot: phase1Screenshot, bodyText: phase1Body });
+
+    // Check for auto-redirect
+    const loginHost = new URL(loginUrl).hostname;
+    let currentHost = "";
+    try { currentHost = new URL(phase1Url).hostname; } catch { currentHost = phase1Url; }
+
+    if (currentHost === loginHost) {
+      // Try clicking elements
+      logStep("SemrushDebug", "Still on gateway, trying to click elements...");
+      try {
+        const clickable = page.locator('.node-card, [class*="node"], a[href*="http"], [class*="card"], button').first();
+        if ((await clickable.count()) > 0) {
+          await clickable.click();
+          await page.waitForTimeout(5000);
+        }
+      } catch {}
+
+      const phase2Url = page.url();
+      const phase2Title = await page.title().catch(() => "");
+      const phase2Screenshot = (await page.screenshot({ type: "jpeg", quality: 50 }).catch(() => Buffer.alloc(0))).toString("base64");
+      const phase2Body = await page.locator('body').innerText().catch(() => "").then(t => t.substring(0, 500));
+      screenshots.push({ phase: "2-after-click", url: phase2Url, title: phase2Title, screenshot: phase2Screenshot, bodyText: phase2Body });
+    }
+
+    // Phase 2: Try login
+    logStep("SemrushDebug", "Phase 2: Trying login...");
+    try {
+      const accTab = page.locator('text=账号密码, [class*="tab"]:has-text("账号"), [role="tab"]:has-text("账号")').first();
+      if ((await accTab.count()) > 0 && (await accTab.isVisible())) {
+        await accTab.click();
+        await page.waitForTimeout(1000);
+      }
+    } catch {}
+
+    // Fill username
+    const userInput = page.locator('input[placeholder*="用户名"], input[placeholder*="账号"], input[placeholder*="account" i], input[type="text"]').first();
+    if ((await userInput.count()) > 0) {
+      await userInput.click();
+      await userInput.fill('');
+      await userInput.fill(cardNumber);
+      logStep("SemrushDebug", "Filled username");
+    }
+
+    // Fill password
+    const pwInput = page.locator('input[type="password"], input[placeholder*="密码"], input[placeholder*="password" i]').first();
+    if ((await pwInput.count()) > 0) {
+      await pwInput.click();
+      await pwInput.fill('');
+      await pwInput.fill(password);
+      logStep("SemrushDebug", "Filled password");
+    }
+
+    // Click login
+    const loginBtn = page.locator('button:has-text("登录"), button:has-text("Login"), button[type="submit"]').first();
+    if ((await loginBtn.count()) > 0) {
+      await loginBtn.click();
+    } else {
+      await page.keyboard.press("Enter");
+    }
+
+    await page.waitForTimeout(5000);
+    await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+
+    const phase3Url = page.url();
+    const phase3Title = await page.title().catch(() => "");
+    const phase3Screenshot = (await page.screenshot({ type: "jpeg", quality: 50 }).catch(() => Buffer.alloc(0))).toString("base64");
+    const phase3Body = await page.locator('body').innerText().catch(() => "").then(t => t.substring(0, 500));
+    screenshots.push({ phase: "3-after-login", url: phase3Url, title: phase3Title, screenshot: phase3Screenshot, bodyText: phase3Body });
+
+    // Phase 3: Look for SEMrush button
+    logStep("SemrushDebug", "Phase 3: Looking for SEMrush button...");
+    const semrushElements = await page.evaluate(() => {
+      const elements: string[] = [];
+      document.querySelectorAll('a, button, [role="button"]').forEach(el => {
+        const text = el.textContent?.trim() || '';
+        const href = el.getAttribute('href') || '';
+        if (text.toLowerCase().includes('semrush') || href.toLowerCase().includes('semrush')) {
+          elements.push(`${el.tagName}: text="${text.substring(0, 50)}" href="${href.substring(0, 100)}"`);
+        }
+      });
+      return elements;
+    });
+    logStep("SemrushDebug", "SEMrush elements found:", JSON.stringify(semrushElements));
+
+    await closeBrowser(browser);
+    return jsonResponse({ success: true, screenshots, semrushElements });
+  } catch (err) {
+    if (browser) await closeBrowser(browser);
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logStep("SemrushDebug", `FAILED: ${errMsg}`);
+    return jsonResponse({ success: false, error: errMsg, screenshots });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // HTTP Server
 // ---------------------------------------------------------------------------
 
@@ -2609,6 +2773,12 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       } else if (url.pathname === "/api/semrush/ads" && req.method === "POST") {
         const request = await makeRequest();
         const response = await handleSemrushAds(request);
+        const body = await response.text();
+        sendJson(JSON.parse(body), response.status);
+      } else if (url.pathname === "/api/semrush/debug" && req.method === "POST") {
+        // Debug endpoint: takes a screenshot at each login phase
+        const request = await makeRequest();
+        const response = await handleSemrushDebug(request);
         const body = await response.text();
         sendJson(JSON.parse(body), response.status);
       } else {
