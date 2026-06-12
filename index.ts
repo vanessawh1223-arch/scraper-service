@@ -13,7 +13,8 @@ interface ExtractRequest {
 
 interface SemrushDomainRequest {
   domain: string;
-  country?: string;
+  country?: string;       // Legacy single country
+  countries?: string[];   // NEW: Target countries from the offer (e.g. ['GB', 'CA'])
   loginUrl: string;
   cardNumber: string;
   password: string;
@@ -28,7 +29,7 @@ interface SemrushAdsRequest {
 }
 
 interface SemrushBatchRequest {
-  domains: Array<{ domain: string; country?: string }>;
+  domains: Array<{ domain: string; country?: string; countries?: string[] }>;
   loginUrl: string;
   cardNumber: string;
   password: string;
@@ -224,6 +225,11 @@ async function launchSemrushBrowser(): Promise<{ browser: Browser; context: Brow
     Object.defineProperty(navigator, "webdriver", { get: () => false });
     (window as any).chrome = { runtime: {}, app: {} };
   });
+
+  // Block static resources to speed up page loads
+  await context.route('**/*.{png,jpg,jpeg,gif,svg,ico,webp,css,woff,woff2,ttf,eot,mp4,webm}',
+    async (route) => { await route.abort(); }
+  );
 
   return { browser, context };
 }
@@ -1909,6 +1915,278 @@ function extractKeywordsFromApiData(capturedApiData: { url: string; body: any }[
   return topKeywords;
 }
 
+// ---------------------------------------------------------------------------
+// API-First Data Extraction Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract country traffic distribution from captured SEMrush API responses.
+ * Returns a map of country_code -> traffic value.
+ * SEMrush overview API typically returns country distribution data.
+ */
+function extractCountryTrafficFromApi(capturedApiData: { url: string; body: any }[]): Record<string, number> {
+  const countryTraffic: Record<string, number> = {};
+  
+  for (const apiResponse of capturedApiData) {
+    try {
+      const bodyStr = JSON.stringify(apiResponse.body);
+      
+      // Strategy 1: Look for structured country distribution data
+      // Common patterns in SEMrush API responses:
+      // - Array of objects with "country" or "database" or "db" + traffic fields
+      // - Nested under keys like "distribution", "countries", "geo", "regions"
+      const searchCountryData = (obj: any, depth = 0): void => {
+        if (depth > 8 || !obj || typeof obj !== 'object') return;
+        
+        if (Array.isArray(obj)) {
+          for (const entry of obj) {
+            if (!entry || typeof entry !== 'object') continue;
+            // Look for entries with country code + traffic
+            const cc = entry.Db || entry.database || entry.country || entry.country_code || entry.cc || entry.region || "";
+            const traffic = entry.Ot || entry.organic_traffic || entry.traffic || entry.OrganicTraffic || 
+                           entry.OtCount || entry.organic_count || entry.search_traffic || 0;
+            if (cc && typeof traffic === 'number' && traffic > 0) {
+              const code = String(cc).toUpperCase();
+              if (code.length === 2) { // Country codes are 2 letters
+                if (!countryTraffic[code] || traffic > countryTraffic[code]) {
+                  countryTraffic[code] = traffic;
+                }
+              }
+            }
+          }
+          return;
+        }
+        
+        for (const key of Object.keys(obj)) {
+          const lowerKey = key.toLowerCase();
+          if (lowerKey.includes('distribut') || lowerKey.includes('countr') || 
+              lowerKey.includes('geo') || lowerKey.includes('region') || 
+              lowerKey === 'data' || lowerKey === 'items' || lowerKey === 'rows' ||
+              lowerKey === 'results' || lowerKey === 'list') {
+            if (Array.isArray(obj[key])) {
+              searchCountryData(obj[key], depth + 1);
+            }
+          }
+          if (typeof obj[key] === 'object' && obj[key] !== null) {
+            searchCountryData(obj[key], depth + 1);
+          }
+        }
+      };
+      
+      searchCountryData(apiResponse.body);
+      
+      // Strategy 2: Regex patterns for country distribution in stringified JSON
+      // Pattern: "Db":"US","Ot":123456 or "country":"GB","traffic":78901
+      const countryPatterns = [
+        /"Db"\s*:\s*"([A-Z]{2})"[^}]*"Ot"\s*:\s*(\d+)/g,
+        /"Ot"\s*:\s*(\d+)[^}]*"Db"\s*:\s*"([A-Z]{2})"/g,
+        /"country"\s*:\s*"([A-Z]{2})"[^}]*"traffic"\s*:\s*(\d+)/gi,
+        /"country_code"\s*:\s*"([A-Z]{2})"[^}]*"organic_traffic"\s*:\s*(\d+)/gi,
+        /"database"\s*:\s*"([A-Z]{2})"[^}]*"organic_traffic"\s*:\s*(\d+)/gi,
+      ];
+      
+      for (const pattern of countryPatterns) {
+        let match;
+        while ((match = pattern.exec(bodyStr)) !== null) {
+          // Handle different group orders
+          let cc: string, trafficStr: string;
+          if (pattern.source.includes('"Ot"\\s*:\\s*(\\d+)')) {
+            // Pattern where Ot comes before Db
+            cc = match[2] || match[1];
+            trafficStr = match[1] || match[2];
+            // Validate: cc must be 2 uppercase letters
+            if (!/^[A-Z]{2}$/.test(cc)) {
+              cc = match[1];
+              trafficStr = match[2];
+            }
+          } else {
+            cc = match[1];
+            trafficStr = match[2];
+          }
+          const traffic = parseInt(trafficStr, 10);
+          if (/^[A-Z]{2}$/.test(cc) && traffic > 0) {
+            if (!countryTraffic[cc] || traffic > countryTraffic[cc]) {
+              countryTraffic[cc] = traffic;
+            }
+          }
+        }
+      }
+    } catch { continue; }
+  }
+  
+  if (Object.keys(countryTraffic).length > 0) {
+    logStep("CountryTraffic", `Extracted traffic for ${Object.keys(countryTraffic).length} countries: ${JSON.stringify(countryTraffic)}`);
+  }
+  
+  return countryTraffic;
+}
+
+/**
+ * Extract organic/paid traffic and paid traffic warning from captured API data.
+ * Returns { organicTraffic, paidTraffic, paidTrafficWarning }.
+ * paidTrafficWarning is true if paid traffic has been 0 for the last 6 months.
+ */
+function extractTrafficFromApiData(capturedApiData: { url: string; body: any }[]): {
+  organicTraffic: number;
+  paidTraffic: number;
+  paidTrafficWarning: boolean;
+} {
+  let organicTraffic = 0;
+  let paidTraffic = 0;
+  let paidTrafficWarning = false;
+  let hasTrendData = false;
+  
+  // Collect monthly paid traffic values for trend analysis
+  const monthlyPaidTraffic: number[] = [];
+  
+  for (const apiResponse of capturedApiData) {
+    try {
+      const bodyStr = JSON.stringify(apiResponse.body);
+      
+      // ── Extract organic traffic ──
+      const organicPatterns = [
+        /"organic[^"]*traffic[^"]*":\s*"?([\d,.]+[KMB]?)"?/i,
+        /"organic_search_traffic[^"]*":\s*(\d+)/i,
+        /"Ot[^"]*":\s*(\d+)/i,
+        /"OrganicTraffic[^"]*":\s*(\d+)/i,
+      ];
+      for (const pattern of organicPatterns) {
+        const match = bodyStr.match(pattern);
+        if (match) {
+          const val = formatNumber(match[1]);
+          if (val > organicTraffic) {
+            organicTraffic = val;
+            logStep("Traffic-API", `Found organic traffic: ${match[1]} → ${val}`);
+          }
+        }
+      }
+      
+      // ── Extract paid traffic ──
+      const paidPatterns = [
+        /"paid[^"]*traffic[^"]*":\s*"?([\d,.]+[KMB]?)"?/i,
+        /"adwords[^"]*traffic[^"]*":\s*(\d+)/i,
+        /"Ad[^"]*":\s*(\d+)/i,
+        /"paid_search_traffic[^"]*":\s*(\d+)/i,
+        /"PaidTraffic[^"]*":\s*(\d+)/i,
+      ];
+      for (const pattern of paidPatterns) {
+        const match = bodyStr.match(pattern);
+        if (match) {
+          const val = formatNumber(match[1]);
+          if (val > paidTraffic) {
+            paidTraffic = val;
+            logStep("Traffic-API", `Found paid traffic: ${match[1]} → ${val}`);
+          }
+        }
+      }
+      
+      // ── Extract monthly trend data for paid traffic warning ──
+      // Look for arrays of monthly data points
+      const searchTrendData = (obj: any, depth = 0): void => {
+        if (depth > 8 || !obj || typeof obj !== 'object') return;
+        
+        if (Array.isArray(obj)) {
+          // Check if this looks like monthly trend data
+          // Each entry should have a date/month field and traffic fields
+          for (const entry of obj) {
+            if (!entry || typeof entry !== 'object') continue;
+            
+            // Look for paid traffic in monthly data
+            const paidValue = entry.Ad || entry.AdCount || entry.paid_traffic || 
+                            entry.adwords_traffic || entry.PaidTraffic || entry.paid_search_traffic || null;
+            if (paidValue !== null) {
+              const paidNum = typeof paidValue === 'number' ? paidValue : parseInt(String(paidValue), 10);
+              if (!isNaN(paidNum)) {
+                monthlyPaidTraffic.push(paidNum);
+                hasTrendData = true;
+              }
+            }
+          }
+        }
+        
+        // Recurse into nested objects
+        for (const key of Object.keys(obj)) {
+          const lowerKey = key.toLowerCase();
+          // Only recurse into likely trend/history containers
+          if (lowerKey.includes('trend') || lowerKey.includes('history') || 
+              lowerKey.includes('monthly') || lowerKey.includes('timeline') ||
+              lowerKey.includes('chart') || lowerKey.includes('graph') ||
+              lowerKey === 'data' || lowerKey === 'items' || lowerKey === 'rows') {
+            searchTrendData(obj[key], depth + 1);
+          }
+          if (typeof obj[key] === 'object' && obj[key] !== null) {
+            searchTrendData(obj[key], depth + 1);
+          }
+        }
+      };
+      
+      searchTrendData(apiResponse.body);
+      
+      // ── Also try regex for trend data ──
+      // Pattern: monthly data with Ad/paid fields
+      const trendRegex = /"Ad(?:Count)?"\s*:\s*(\d+)/g;
+      let trendMatch;
+      const regexPaidValues: number[] = [];
+      while ((trendMatch = trendRegex.exec(bodyStr)) !== null) {
+        const val = parseInt(trendMatch[1], 10);
+        if (!isNaN(val)) {
+          regexPaidValues.push(val);
+          hasTrendData = true;
+        }
+      }
+      if (regexPaidValues.length > monthlyPaidTraffic.length) {
+        monthlyPaidTraffic.length = 0;
+        monthlyPaidTraffic.push(...regexPaidValues);
+      }
+    } catch { continue; }
+  }
+  
+  // ── Determine paid traffic warning ──
+  // If we have trend data, check if paid traffic has been 0 for the last 6 months
+  if (hasTrendData && monthlyPaidTraffic.length >= 6) {
+    const last6Months = monthlyPaidTraffic.slice(-6);
+    const allZero = last6Months.every(v => v === 0);
+    if (allZero) {
+      paidTrafficWarning = true;
+      logStep("Traffic-API", "Paid traffic warning: last 6 months all zero");
+    }
+  } else if (paidTraffic === 0 && organicTraffic > 0) {
+    // If we don't have trend data but current paid traffic is 0 while organic exists,
+    // conservatively set warning (we can't confirm 6 months, but it's a signal)
+    paidTrafficWarning = true;
+    logStep("Traffic-API", "Paid traffic warning: current paid=0, organic>0, no trend data");
+  }
+  
+  return { organicTraffic, paidTraffic, paidTrafficWarning };
+}
+
+/**
+ * Select the best country from target countries based on SEMrush traffic data.
+ * Returns the country code with the highest traffic among the target countries.
+ */
+function selectBestCountry(
+  targetCountries: string[],
+  countryTrafficMap: Record<string, number>
+): string {
+  if (targetCountries.length === 0) return 'US';
+  if (targetCountries.length === 1) return targetCountries[0].toUpperCase();
+  
+  let bestCountry = targetCountries[0].toUpperCase();
+  let maxTraffic = 0;
+  
+  for (const c of targetCountries) {
+    const cc = c.toUpperCase();
+    const traffic = countryTrafficMap[cc] || 0;
+    if (traffic > maxTraffic) {
+      maxTraffic = traffic;
+      bestCountry = cc;
+    }
+  }
+  
+  logStep("CountrySelect", `Target countries: [${targetCountries.join(',')}], traffic map: ${JSON.stringify(countryTrafficMap)}, selected: ${bestCountry} (traffic: ${maxTraffic})`);
+  return bestCountry;
+}
+
 async function navigateToSemrushPage(
   page: Page,
   baseUrl: string,
@@ -1967,13 +2245,15 @@ async function navigateToSemrushPage(
 
 // ---------------------------------------------------------------------------
 // Batch Query Helper — Queries a single domain using an already-logged-in page
+// API interception first, DOM scraping as fallback only
 // ---------------------------------------------------------------------------
 
 async function querySingleDomain(
   page: Page,
   semrushBaseUrl: string,
   domain: string,
-  country: string
+  country: string,
+  targetCountries: string[] = []
 ): Promise<{
   success: boolean;
   domain: string;
@@ -1981,57 +2261,93 @@ async function querySingleDomain(
   isSubdomain: boolean;
   organicTraffic: number;
   paidTraffic: number;
+  paidTrafficWarning: boolean;
   topKeywords: TopKeyword[];
-  rootDomainData: { domain: string; organicTraffic: number; paidTraffic: number } | null;
+  rootDomainData: { domain: string; organicTraffic: number; paidTraffic: number; topKeywords: TopKeyword[] } | null;
   error?: string;
 }> {
-  const countryDb = country.toUpperCase();
-  logStep("BatchQuery", `Querying domain: ${domain} (${countryDb})`);
+  const subDomain = isSubdomain(domain);
+  const targetCCs = targetCountries.length > 0 ? targetCountries.map(c => c.toUpperCase()) : [country.toUpperCase()];
+  const initialCountry = targetCCs[0];
+  
+  logStep("Query", `Querying domain: ${domain}, target countries: [${targetCCs.join(',')}], initial: ${initialCountry}`);
 
   try {
-    // Clear previous API captures by setting up fresh interceptor
+    // ── Set up comprehensive API response interceptor ──
     const capturedApiData: { url: string; body: any }[] = [];
     const responseListener = async (response: any) => {
       try {
         const url = response.url();
-        // Broadened matching — proxy versions may use different URL patterns
-        if (url.includes('/analytics/') || url.includes('/api/') || url.includes('overview') || url.includes('organic') || url.includes('adwords') || url.includes('paid') || url.includes('keyword') || url.includes('search') || url.includes('report') || url.includes('positions')) {
-          const contentType = response.headers()['content-type'] || '';
-          if (contentType.includes('json')) {
-            const jsonBody = await response.json().catch(() => null);
-            if (jsonBody) capturedApiData.push({ url, body: jsonBody });
+        const contentType = response.headers()['content-type'] || '';
+        if (contentType.includes('json')) {
+          const jsonBody = await response.json().catch(() => null);
+          if (jsonBody) {
+            capturedApiData.push({ url, body: jsonBody });
+            logStep("API-Capture", url.substring(0, 120));
           }
         }
       } catch {}
     };
     page.on('response', responseListener);
 
-    // Step 1: Navigate to domain overview
-    const overviewOk = await navigateToSemrushPage(page, semrushBaseUrl, "/analytics/overview/", domain, countryDb);
+    // ── Step 1: Navigate to domain overview with initial country ──
+    logStep("Query", "Step 1: Navigating to domain overview...");
+    const overviewOk = await navigateToSemrushPage(page, semrushBaseUrl, "/analytics/overview/", domain, initialCountry);
     if (!overviewOk) {
       page.off('response', responseListener);
-      return { success: false, domain, country: countryDb, isSubdomain: false, organicTraffic: 0, paidTraffic: 0, topKeywords: [], rootDomainData: null, error: "Failed to load domain overview page" };
+      return { success: false, domain, country: initialCountry, isSubdomain: subDomain, organicTraffic: 0, paidTraffic: 0, paidTrafficWarning: false, topKeywords: [], rootDomainData: null, error: "Failed to load domain overview page" };
     }
 
-    // Step 2: Extract traffic from API data
+    // Wait a bit for API responses to be captured
+    await page.waitForTimeout(3000);
+
+    // ── Step 2: Determine the best country from target countries ──
+    logStep("Query", "Step 2: Determining best country from target list...");
+    const countryTrafficMap = extractCountryTrafficFromApi(capturedApiData);
+    let bestCountry = selectBestCountry(targetCCs, countryTrafficMap);
+
+    // If best country differs from initial, re-navigate to get correct data
+    if (bestCountry !== initialCountry) {
+      logStep("Query", `Best country is ${bestCountry} (different from initial ${initialCountry}), re-navigating...`);
+      capturedApiData.length = 0; // Clear captured data
+      const reNavOk = await navigateToSemrushPage(page, semrushBaseUrl, "/analytics/overview/", domain, bestCountry);
+      if (!reNavOk) {
+        logStep("Query", `Re-navigation with ${bestCountry} failed, falling back to ${initialCountry}`);
+        bestCountry = initialCountry;
+      } else {
+        await page.waitForTimeout(3000);
+      }
+    }
+
+    // ── Step 3: Extract traffic data from API responses ──
+    logStep("Query", "Step 3: Extracting traffic data...");
     let organicTraffic = 0;
     let paidTraffic = 0;
-    for (const apiResponse of capturedApiData) {
-      try {
-        const bodyStr = JSON.stringify(apiResponse.body);
-        const organicMatch = bodyStr.match(/"organic[^"]*traffic[^"]*":\s*"?([\d,.]+[KMB]?)"?/i) || bodyStr.match(/"organic_search_traffic[^"]*":\s*(\d+)/i) || bodyStr.match(/"Ot[^"]*":\s*(\d+)/i);
-        if (organicMatch) { const val = formatNumber(organicMatch[1]); if (val > organicTraffic) organicTraffic = val; }
-        const paidMatch = bodyStr.match(/"paid[^"]*traffic[^"]*":\s*"?([\d,.]+[KMB]?)"?/i) || bodyStr.match(/"adwords[^"]*traffic[^"]*":\s*(\d+)/i) || bodyStr.match(/"Ad[^"]*":\s*(\d+)/i) || bodyStr.match(/"paid_search_traffic[^"]*":\s*(\d+)/i);
-        if (paidMatch) { const val = formatNumber(paidMatch[1]); if (val > paidTraffic) paidTraffic = val; }
-      } catch {}
+    let paidTrafficWarning = false;
+
+    // API-first extraction
+    const trafficResult = extractTrafficFromApiData(capturedApiData);
+    organicTraffic = trafficResult.organicTraffic;
+    paidTraffic = trafficResult.paidTraffic;
+    paidTrafficWarning = trafficResult.paidTrafficWarning;
+
+    // DOM fallback only if API extraction failed
+    if (organicTraffic === 0) {
+      logStep("Query", "API traffic extraction found nothing, trying DOM...");
+      organicTraffic = await extractOrganicTraffic(page);
+    }
+    if (paidTraffic === 0) {
+      paidTraffic = await extractPaidTraffic(page);
     }
 
-    if (organicTraffic === 0) organicTraffic = await extractOrganicTraffic(page);
-    if (paidTraffic === 0) paidTraffic = await extractPaidTraffic(page);
+    logStep("Query", `Traffic: organic=${organicTraffic}, paid=${paidTraffic}, warning=${paidTrafficWarning}`);
 
-    // Step 3: Extract top keywords
+    // ── Step 4: Navigate to positions page and extract keywords ──
+    logStep("Query", "Step 4: Extracting keywords...");
     let topKeywords: TopKeyword[] = [];
-    const positionsUrl = `${semrushBaseUrl}/analytics/organic/positions/?q=${encodeURIComponent(domain)}&db=${countryDb}&display_sort=pos_num&display_direction=asc`;
+    capturedApiData.length = 0; // Clear for new page's API responses
+
+    const positionsUrl = `${semrushBaseUrl}/analytics/organic/positions/?q=${encodeURIComponent(domain)}&db=${bestCountry}&display_sort=pos_num&display_direction=asc`;
     let positionsOk = false;
     try {
       await page.goto(positionsUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
@@ -2039,62 +2355,88 @@ async function querySingleDomain(
       try { await page.waitForLoadState("networkidle", { timeout: 20000 }); } catch {}
       positionsOk = true;
     } catch {}
-    
+
     if (positionsOk) {
-      // Extra wait + scroll to ensure table is fully loaded
+      // Wait for API responses to be captured
       await page.waitForTimeout(2000);
-      try {
-        await page.evaluate(async () => {
-          for (let i = 0; i < 8; i++) {
-            window.scrollBy(0, 600);
-            await new Promise(r => setTimeout(r, 400));
-          }
-          window.scrollTo(0, 0);
-        });
-        await page.waitForTimeout(1000);
-      } catch {}
 
-      // Strategy 1: API extraction
+      // Strategy 1: API extraction (most reliable)
       topKeywords = extractKeywordsFromApiData(capturedApiData);
-      // Strategy 2: DOM scraping
-      if (topKeywords.length === 0) topKeywords = await extractTopKeywords(page);
-      // Strategy 3: Inline script extraction
-      if (topKeywords.length === 0) topKeywords = await extractKeywordsFromScripts(page);
-
-      // Debug dump when keywords = 0
-      if (topKeywords.length === 0) {
-        logStep("BatchQuery", `KEYWORD DEBUG for ${domain}: 0 keywords found. API responses=${capturedApiData.length}`);
-        for (let i = 0; i < Math.min(capturedApiData.length, 5); i++) {
-          logStep("BatchQuery", `  API[${i}] URL: ${capturedApiData[i].url.substring(0, 120)} | body: ${JSON.stringify(capturedApiData[i].body).substring(0, 300)}`);
-        }
-        try {
-          const tableInfo = await page.evaluate(() => {
-            const tables = document.querySelectorAll('table');
-            return { tableCount: tables.length, bodyPreview: document.body?.innerText?.substring(0, 300) || '' };
-          });
-          logStep("BatchQuery", `  Tables: ${tableInfo.tableCount}, body: ${tableInfo.bodyPreview}`);
-        } catch {}
+      if (topKeywords.length > 0) {
+        logStep("Query", `Got ${topKeywords.length} keywords from API data`);
       }
+
+      // Strategy 2: Inline script extraction
+      if (topKeywords.length === 0) {
+        logStep("Query", "API extraction yielded no keywords, trying script extraction...");
+        topKeywords = await extractKeywordsFromScripts(page);
+      }
+
+      // Strategy 3: DOM fallback (limited to 3 pages max)
+      if (topKeywords.length === 0) {
+        logStep("Query", "Script extraction yielded no keywords, trying DOM...");
+        topKeywords = await extractTopKeywords(page, 3);
+      }
+
+      if (topKeywords.length === 0) {
+        logStep("Query", `KEYWORD DEBUG for ${domain}: 0 keywords found. API responses=${capturedApiData.length}`);
+      }
+    } else {
+      logStep("Query", "Could not load positions page, skipping keyword extraction");
     }
 
-    // Step 4: Root domain data for subdomains
-    let rootDomainData: { domain: string; organicTraffic: number; paidTraffic: number } | null = null;
-    if (isSubdomain(domain)) {
+    // ── Step 5: Root domain data for subdomains ──
+    let rootDomainData: { domain: string; organicTraffic: number; paidTraffic: number; topKeywords: TopKeyword[] } | null = null;
+    if (subDomain) {
+      logStep("Query", "Step 5: Domain is subdomain, fetching root domain data...");
       const rootDomain = getRootDomain(domain);
-      const rootOk = await navigateToSemrushPage(page, semrushBaseUrl, "/analytics/overview/", rootDomain, countryDb);
+      capturedApiData.length = 0;
+      
+      const rootOk = await navigateToSemrushPage(page, semrushBaseUrl, "/analytics/overview/", rootDomain, bestCountry);
       if (rootOk) {
-        rootDomainData = { domain: rootDomain, organicTraffic: await extractOrganicTraffic(page), paidTraffic: await extractPaidTraffic(page) };
+        await page.waitForTimeout(3000);
+        
+        // Extract root traffic from API
+        const rootTrafficResult = extractTrafficFromApiData(capturedApiData);
+        let rootOrganic = rootTrafficResult.organicTraffic;
+        let rootPaid = rootTrafficResult.paidTraffic;
+        
+        // DOM fallback
+        if (rootOrganic === 0) rootOrganic = await extractOrganicTraffic(page);
+        if (rootPaid === 0) rootPaid = await extractPaidTraffic(page);
+
+        // Get root domain keywords
+        capturedApiData.length = 0;
+        let rootKeywords: TopKeyword[] = [];
+        const rootPositionsUrl = `${semrushBaseUrl}/analytics/organic/positions/?q=${encodeURIComponent(rootDomain)}&db=${bestCountry}&display_sort=pos_num&display_direction=asc`;
+        let rootPositionsOk = false;
+        try {
+          await page.goto(rootPositionsUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+          await page.waitForTimeout(3000);
+          try { await page.waitForLoadState("networkidle", { timeout: 20000 }); } catch {}
+          rootPositionsOk = true;
+        } catch {}
+
+        if (rootPositionsOk) {
+          await page.waitForTimeout(2000);
+          rootKeywords = extractKeywordsFromApiData(capturedApiData);
+          if (rootKeywords.length === 0) rootKeywords = await extractKeywordsFromScripts(page);
+          if (rootKeywords.length === 0) rootKeywords = await extractTopKeywords(page, 3);
+        }
+
+        rootDomainData = { domain: rootDomain, organicTraffic: rootOrganic, paidTraffic: rootPaid, topKeywords: rootKeywords };
+        logStep("Query", `Root domain: organic=${rootOrganic}, paid=${rootPaid}, keywords=${rootKeywords.length}`);
       }
     }
 
     page.off('response', responseListener);
 
-    logStep("BatchQuery", `Completed: ${domain} organic=${organicTraffic}, paid=${paidTraffic}, keywords=${topKeywords.length}`);
-    return { success: true, domain, country: countryDb, isSubdomain: isSubdomain(domain), organicTraffic, paidTraffic, topKeywords, rootDomainData };
+    logStep("Query", `Completed: ${domain} (${bestCountry}) organic=${organicTraffic}, paid=${paidTraffic}, warning=${paidTrafficWarning}, keywords=${topKeywords.length}`);
+    return { success: true, domain, country: bestCountry, isSubdomain: subDomain, organicTraffic, paidTraffic, paidTrafficWarning, topKeywords, rootDomainData };
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
-    logStep("BatchQuery", `FAILED: ${domain} - ${errMsg}`);
-    return { success: false, domain, country: countryDb, isSubdomain: false, organicTraffic: 0, paidTraffic: 0, topKeywords: [], rootDomainData: null, error: errMsg };
+    logStep("Query", `FAILED: ${domain} - ${errMsg}`);
+    return { success: false, domain, country: initialCountry, isSubdomain: false, organicTraffic: 0, paidTraffic: 0, paidTrafficWarning: false, topKeywords: [], rootDomainData: null, error: errMsg };
   }
 }
 
@@ -2106,267 +2448,35 @@ async function handleSemrushDomain(req: Request): Promise<Response> {
   let body: SemrushDomainRequest;
   try { body = (await req.json()) as SemrushDomainRequest; } catch { return jsonResponse({ success: false, error: "Invalid JSON body" }, 400); }
 
-  const { domain, country = "US", loginUrl, cardNumber, password } = body;
+  const { domain, country = "US", countries, loginUrl, cardNumber, password } = body;
   if (!domain || !loginUrl || !cardNumber || !password) {
     return jsonResponse({ success: false, error: "domain, loginUrl, cardNumber, and password are required" }, 400);
   }
 
-  logStep("SemrushDomain", `Starting domain query: ${domain} (${country})`);
+  const targetCountries = countries || [country];
+  logStep("SemrushDomain", `Starting domain query: ${domain}, countries: [${targetCountries.join(',')}]`);
   let browser: Browser | null = null;
 
   try {
     const { browser: launchedBrowser, context } = await launchSemrushBrowser();
     browser = launchedBrowser;
 
-    // Step 1: Login (3-phase: gateway → proxy → SEMrush)
+    // Step 1: Login
     logStep("SemrushDomain", "Step 1: Logging in...");
     const { page, semrushBaseUrl } = await semrushLogin(context, loginUrl, cardNumber, password);
     logStep("SemrushDomain", `Using SEMrush base URL: ${semrushBaseUrl}`);
 
-    const countryDb = country.toUpperCase();
-
-    // ── Network interception: capture SEMrush API responses ──
-    const capturedApiData: { url: string; body: any }[] = [];
-    page.on('response', async (response) => {
-      try {
-        const url = response.url();
-        // Broadened SEMrush API endpoint matching — proxy versions may use different URL patterns
-        if (
-          url.includes('/analytics/') ||
-          url.includes('/api/') ||
-          url.includes('overview') ||
-          url.includes('organic') ||
-          url.includes('adwords') ||
-          url.includes('paid') ||
-          url.includes('keyword') ||
-          url.includes('search') ||
-          url.includes('report') ||
-          url.includes('positions')
-        ) {
-          const contentType = response.headers()['content-type'] || '';
-          if (contentType.includes('json')) {
-            const jsonBody = await response.json().catch(() => null);
-            if (jsonBody) {
-              capturedApiData.push({ url, body: jsonBody });
-              logStep("SemrushDomain", `Captured API response: ${url.substring(0, 120)}`);
-            }
-          }
-        }
-      } catch {}
-    });
-
-    // Step 2: Navigate to domain overview
-    logStep("SemrushDomain", "Step 2: Navigating to domain overview...");
-    const overviewOk = await navigateToSemrushPage(page, semrushBaseUrl, "/analytics/overview/", domain, countryDb);
-
-    if (!overviewOk) {
-      throw new Error("Failed to load domain overview page (session may have expired)");
-    }
-
-    // Collect debug info from the page
-    let debugInfo: { pageUrl: string; pageTitle: string; bodyTextPreview: string; semrushBaseUrl: string; capturedApiCount: number } | undefined;
-    try {
-      const pageText = await page.locator('body').innerText().catch(() => "");
-      const pageTitle = await page.title().catch(() => "");
-      const pageUrl = page.url();
-      debugInfo = { pageUrl, pageTitle, bodyTextPreview: pageText.substring(0, 1000), semrushBaseUrl, capturedApiCount: capturedApiData.length };
-      logStep("SemrushDomain", `Page title: "${pageTitle}", URL: ${pageUrl}`);
-      logStep("SemrushDomain", `Captured ${capturedApiData.length} API responses`);
-      logStep("SemrushDomain", `Page text (first 300): ${pageText.substring(0, 300)}`);
-    } catch {}
-
-    // Step 3: Try extracting from captured API data first (most reliable)
-    logStep("SemrushDomain", "Step 3: Extracting data from captured API responses...");
-    let organicTraffic = 0;
-    let paidTraffic = 0;
-
-    for (const apiResponse of capturedApiData) {
-      try {
-        const bodyStr = JSON.stringify(apiResponse.body);
-        // Look for organic traffic data in API responses
-        const organicMatch = bodyStr.match(/"organic[^"]*traffic[^"]*":\s*"?([\d,.]+[KMB]?)"?/i) ||
-                            bodyStr.match(/"organic_search_traffic[^"]*":\s*(\d+)/i) ||
-                            bodyStr.match(/"Ot[^"]*":\s*(\d+)/i);
-        if (organicMatch) {
-          const val = formatNumber(organicMatch[1]);
-          if (val > organicTraffic) {
-            organicTraffic = val;
-            logStep("SemrushDomain", `Found organic traffic in API: ${organicMatch[1]} → ${val} (from ${apiResponse.url.substring(0, 80)})`);
-          }
-        }
-        // Look for paid traffic data
-        const paidMatch = bodyStr.match(/"paid[^"]*traffic[^"]*":\s*"?([\d,.]+[KMB]?)"?/i) ||
-                         bodyStr.match(/"adwords[^"]*traffic[^"]*":\s*(\d+)/i) ||
-                         bodyStr.match(/"Ad[^"]*":\s*(\d+)/i) ||
-                         bodyStr.match(/"paid_search_traffic[^"]*":\s*(\d+)/i);
-        if (paidMatch) {
-          const val = formatNumber(paidMatch[1]);
-          if (val > paidTraffic) {
-            paidTraffic = val;
-            logStep("SemrushDomain", `Found paid traffic in API: ${paidMatch[1]} → ${val} (from ${apiResponse.url.substring(0, 80)})`);
-          }
-        }
-      } catch {}
-    }
-
-    // Step 4: If API data didn't work, fall back to DOM extraction
-    if (organicTraffic === 0) {
-      logStep("SemrushDomain", "Step 4: API extraction found nothing, trying DOM extraction...");
-      organicTraffic = await extractOrganicTraffic(page);
-      logStep("SemrushDomain", `Organic traffic (DOM): ${organicTraffic}`);
-    } else {
-      logStep("SemrushDomain", `Organic traffic (API): ${organicTraffic}`);
-    }
-
-    if (paidTraffic === 0) {
-      paidTraffic = await extractPaidTraffic(page);
-      logStep("SemrushDomain", `Paid traffic (DOM): ${paidTraffic}`);
-    } else {
-      logStep("SemrushDomain", `Paid traffic (API): ${paidTraffic}`);
-    }
-
-    // Step 5: Navigate to organic positions for top keywords (sorted by position ascending)
-    logStep("SemrushDomain", "Step 5: Extracting top keywords...");
-    let topKeywords: TopKeyword[] = [];
-    // Navigate with sort by position ascending so position-1 keywords appear first
-    const positionsUrl = `${semrushBaseUrl}/analytics/organic/positions/?q=${encodeURIComponent(domain)}&db=${countryDb}&display_sort=pos_num&display_direction=asc`;
-    logStep("SemrushDomain", `Navigating to positions page with sort: ${positionsUrl}`);
-    let positionsOk = false;
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        await page.goto(positionsUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-        await page.waitForTimeout(3000);
-        try { await page.waitForLoadState("networkidle", { timeout: 20000 }); } catch {}
-        const pageTitle = await page.title().catch(() => "");
-        const currentUrl = page.url();
-        if (pageTitle === "登录" || pageTitle === "Login" || currentUrl.includes("login")) {
-          logStep("SemrushDomain", "WARNING: On login page during positions navigation - session expired");
-          break;
-        }
-        positionsOk = true;
-        break;
-      } catch (err) {
-        logStep("SemrushDomain", `Positions page attempt ${attempt} failed: ${err}`);
-      }
-    }
-    if (positionsOk) {
-      // Extra wait + scroll to ensure table is fully loaded (proxy pages can be slow / use lazy loading)
-      await page.waitForTimeout(2000);
-      logStep("SemrushDomain", "Scrolling positions page to trigger lazy loading...");
-      try {
-        await page.evaluate(async () => {
-          for (let i = 0; i < 8; i++) {
-            window.scrollBy(0, 600);
-            await new Promise(r => setTimeout(r, 400));
-          }
-          window.scrollTo(0, 0);
-        });
-        await page.waitForTimeout(1000);
-      } catch {}
-
-      // Strategy 1: Try API extraction first (most reliable)
-      topKeywords = extractKeywordsFromApiData(capturedApiData);
-      if (topKeywords.length > 0) {
-        logStep("SemrushDomain", `Got ${topKeywords.length} keywords from API data`);
-      } else {
-        // Strategy 2: Fall back to DOM scraping with pagination support
-        logStep("SemrushDomain", "API extraction yielded no keywords, falling back to DOM scraping...");
-        topKeywords = await extractTopKeywords(page);
-      }
-
-      // Strategy 3: Try inline script extraction if still no keywords
-      if (topKeywords.length === 0) {
-        logStep("SemrushDomain", "DOM scraping also yielded no keywords, trying inline script extraction...");
-        topKeywords = await extractKeywordsFromScripts(page);
-      }
-
-      // ── Comprehensive debug dump when keywords = 0 ──
-      if (topKeywords.length === 0) {
-        logStep("SemrushDomain", "=== KEYWORD EXTRACTION DEBUG DUMP (0 keywords found) ===");
-
-        // Dump captured API URLs and their structure
-        logStep("SemrushDomain", `Captured API responses: ${capturedApiData.length}`);
-        for (let i = 0; i < Math.min(capturedApiData.length, 10); i++) {
-          const apiResp = capturedApiData[i];
-          const bodyPreview = JSON.stringify(apiResp.body).substring(0, 500);
-          logStep("SemrushDomain", `  API[${i}] URL: ${apiResp.url.substring(0, 150)}`);
-          logStep("SemrushDomain", `  API[${i}] Body (first 500): ${bodyPreview}`);
-        }
-        if (capturedApiData.length === 0) {
-          logStep("SemrushDomain", "  No API responses were captured at all — proxy may use SSR instead of API calls");
-        }
-
-        // Dump table HTML
-        try {
-          const tableHtml = await page.evaluate(() => {
-            const tables = document.querySelectorAll('table');
-            if (tables.length > 0) return tables[0].outerHTML.substring(0, 2000);
-            const divTables = document.querySelectorAll('[class*="table"], [class*="Table"], [role="table"]');
-            if (divTables.length > 0) return divTables[0].outerHTML.substring(0, 2000);
-            return 'NO TABLE FOUND';
-          });
-          logStep("SemrushDomain", `Table HTML (first 2000): ${tableHtml}`);
-        } catch {}
-
-        // Dump page body text
-        try {
-          const bodyText = await page.locator('body').innerText().catch(() => "");
-          logStep("SemrushDomain", `Page body text (first 500): ${bodyText.substring(0, 500)}`);
-        } catch {}
-
-        // Dump page URL and title
-        logStep("SemrushDomain", `Current page URL: ${page.url()}`);
-        logStep("SemrushDomain", `Current page title: ${await page.title().catch(() => "")}`);
-
-        // Check for inline scripts containing keyword data
-        try {
-          const scriptSummary = await page.evaluate(() => {
-            const scripts = document.querySelectorAll('script');
-            const summary: string[] = [];
-            for (const script of scripts) {
-              const content = script.textContent || '';
-              if (content.includes('Ph') || content.includes('keyword') || content.includes('position') || content.includes('organic')) {
-                summary.push(`Script (len=${content.length}, has_Ph=${content.includes('"Ph"')}, has_keyword=${content.includes('keyword')}, has_position=${content.includes('position')}): ${content.substring(0, 200)}`);
-              }
-            }
-            return summary;
-          });
-          logStep("SemrushDomain", `Relevant inline scripts: ${scriptSummary.length}`);
-          for (const s of scriptSummary.slice(0, 5)) {
-            logStep("SemrushDomain", `  ${s}`);
-          }
-        } catch {}
-
-        logStep("SemrushDomain", "=== END DEBUG DUMP ===");
-      }
-    } else {
-      logStep("SemrushDomain", "Could not load positions page, skipping keyword extraction");
-    }
-
-    // Step 6: Check if domain is a subdomain
-    let rootDomainData: { domain: string; organicTraffic: number; paidTraffic: number } | null = null;
-    if (isSubdomain(domain)) {
-      logStep("SemrushDomain", "Step 6: Domain is subdomain, fetching root domain data...");
-      const rootDomain = getRootDomain(domain);
-      const rootOk = await navigateToSemrushPage(page, semrushBaseUrl, "/analytics/overview/", rootDomain, countryDb);
-      if (rootOk) {
-        rootDomainData = {
-          domain: rootDomain,
-          organicTraffic: await extractOrganicTraffic(page),
-          paidTraffic: await extractPaidTraffic(page),
-        };
-        logStep("SemrushDomain", `Root domain data: organic=${rootDomainData.organicTraffic}, paid=${rootDomainData.paidTraffic}`);
-      }
-    }
+    // Step 2: Query domain (API-first with country selection logic)
+    logStep("SemrushDomain", "Step 2: Querying domain...");
+    const result = await querySingleDomain(page, semrushBaseUrl, domain, country, targetCountries);
 
     await closeBrowser(browser);
-    logStep("SemrushDomain", `SUCCESS: organic=${organicTraffic}, paid=${paidTraffic}, keywords=${topKeywords.length}`);
 
-    return jsonResponse({
-      success: true, domain, country: countryDb, isSubdomain: isSubdomain(domain),
-      organicTraffic, paidTraffic, topKeywords, rootDomainData,
-      debug: debugInfo,
-    });
+    if (result.success) {
+      logStep("SemrushDomain", `SUCCESS: organic=${result.organicTraffic}, paid=${result.paidTraffic}, warning=${result.paidTrafficWarning}, keywords=${result.topKeywords.length}`);
+    }
+
+    return jsonResponse(result);
   } catch (err) {
     if (browser) await closeBrowser(browser);
     const errMsg = err instanceof Error ? err.message : String(err);
@@ -2555,10 +2665,11 @@ async function handleSemrushBatch(req: IncomingMessage, res: ServerResponse): Pr
     for (const item of domains) {
       const domain = item.domain;
       const country = item.country || "US";
+      const targetCountries = item.countries || [country];
 
       sendLine({ type: "progress", step: "querying", domain, completed, total: domains.length, message: `Querying ${domain}...` });
 
-      const result = await querySingleDomain(page, semrushBaseUrl, domain, country);
+      const result = await querySingleDomain(page, semrushBaseUrl, domain, country, targetCountries);
       completed++;
       if (result.success) succeeded++;
 
