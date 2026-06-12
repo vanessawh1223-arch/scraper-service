@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright:v1.52.0-noble
+FROM mcr.microsoft.com/playwright:v1.60.0-noble
 
 WORKDIR /app
 
@@ -11,6 +11,9 @@ ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 # Install Node.js dependencies only (no browser download)
 RUN npm install --production
 
+# Build the TypeScript to JavaScript
+RUN npx esbuild index.ts --outfile=index.js --platform=node --format=cjs --target=node24
+
 # Copy source code
 COPY index.ts ./
 
@@ -21,5 +24,5 @@ EXPOSE 3001
 ENV NODE_ENV=production
 ENV PORT=3001
 
-# Start the service
-CMD ["npx", "tsx", "index.ts"]
+# Start the service with GC enabled
+CMD ["node", "--expose-gc", "index.js"]
