@@ -3,10 +3,13 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "start": "npx tsx index.ts"
+    "build": "npx esbuild index.ts --outfile=index.js --platform=node --format=cjs --target=node24",
+    "start": "node --expose-gc index.js",
+    "dev": "npx tsx index.ts"
   },
   "dependencies": {
-    "playwright": "1.52.0",
-    "tsx": "^4.19.0"
+    "playwright": "^1.60.0",
+    "tsx": "^4.19.0",
+    "esbuild": "^0.28.0"
   }
 }

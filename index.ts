@@ -174,6 +174,10 @@ async function launchBrowser(proxy?: string): Promise<{ browser: Browser; contex
       "--disable-gpu", "--disable-blink-features=AutomationControlled",
       "--disable-features=SubresourceFilter,SafeBrowsing",
       "--disable-web-security", "--disable-extensions", "--no-first-run",
+      "--js-flags=--max-old-space-size=256", "--disable-soft-reload",
+      "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
+      "--disable-renderer-backgrounding", "--disable-ipc-flooding-protection",
+      "--single-process", "--disable-site-isolation-trials",
     ],
   };
   if (proxy) launchOptions.proxy = parseProxy(proxy);
@@ -191,7 +195,7 @@ async function launchBrowser(proxy?: string): Promise<{ browser: Browser; contex
   return { browser, context };
 }
 
-// For SEMrush - NO route bypass, NO single-process (causes issues in Docker)
+// For SEMrush - NO route bypass; single-process for memory-constrained environments
 async function launchSemrushBrowser(): Promise<{ browser: Browser; context: BrowserContext }> {
   const browser = await chromium.launch({
     headless: true,
@@ -201,6 +205,10 @@ async function launchSemrushBrowser(): Promise<{ browser: Browser; context: Brow
       "--disable-background-networking", "--no-first-run",
       "--disable-blink-features=AutomationControlled",
       "--disable-features=SubresourceFilter,SafeBrowsing",
+      "--js-flags=--max-old-space-size=256", "--disable-soft-reload",
+      "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
+      "--disable-renderer-backgrounding", "--disable-ipc-flooding-protection",
+      "--single-process", "--disable-site-isolation-trials",
     ],
   });
 
@@ -224,6 +232,8 @@ async function launchSemrushBrowser(): Promise<{ browser: Browser; context: Brow
 
 async function closeBrowser(browser: Browser): Promise<void> {
   try { await browser.close(); } catch (err) { console.error("Error closing browser:", err); }
+  // Force garbage collection if available (requires --expose-gc flag)
+  try { if (typeof globalThis.gc === 'function') globalThis.gc(); } catch {}
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +325,8 @@ async function extractOnce(
 
   const landingPageUrl = isChromeError(currentUrl) || isSameUrl(currentUrl, affiliateLink) ? null : currentUrl;
   await browser.close();
+  // Force garbage collection if available (requires --expose-gc flag)
+  try { if (typeof globalThis.gc === 'function') globalThis.gc(); } catch {}
   return { success: !!landingPageUrl, landingPageUrl, redirectChain, finalUrl: landingPageUrl };
 }
 
@@ -2789,6 +2801,15 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       sendJson({ error: "Internal server error" }, 500);
     }
   });
+
+// Prevent the process from dying on unhandled errors
+process.on("uncaughtException", (err) => {
+  console.error("[UNCAUGHT EXCEPTION]", err);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[UNHANDLED REJECTION]", reason);
+});
 
 server.listen(PORT, () => {
   console.log(`Scraper service running on port ${PORT}`);
