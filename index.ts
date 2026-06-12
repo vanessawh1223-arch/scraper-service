@@ -177,7 +177,6 @@ async function launchBrowser(proxy?: string): Promise<{ browser: Browser; contex
       "--js-flags=--max-old-space-size=256", "--disable-soft-reload",
       "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
       "--disable-renderer-backgrounding", "--disable-ipc-flooding-protection",
-      "--single-process", "--disable-site-isolation-trials",
     ],
   };
   if (proxy) launchOptions.proxy = parseProxy(proxy);
@@ -195,7 +194,7 @@ async function launchBrowser(proxy?: string): Promise<{ browser: Browser; contex
   return { browser, context };
 }
 
-// For SEMrush - NO route bypass; single-process for memory-constrained environments
+// For SEMrush - NO route bypass
 async function launchSemrushBrowser(): Promise<{ browser: Browser; context: BrowserContext }> {
   const browser = await chromium.launch({
     headless: true,
@@ -208,7 +207,6 @@ async function launchSemrushBrowser(): Promise<{ browser: Browser; context: Brow
       "--js-flags=--max-old-space-size=256", "--disable-soft-reload",
       "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
       "--disable-renderer-backgrounding", "--disable-ipc-flooding-protection",
-      "--single-process", "--disable-site-isolation-trials",
     ],
   });
 
