@@ -91,12 +91,24 @@ function isSubdomain(domain: string): boolean {
   const parts = domain.split(".");
   if (parts.length <= 2) return false;
   if (parts[0] === "www") return parts.length > 3;
+  // Handle multi-part TLDs (e.g. co.uk, com.au)
+  const lastTwo = parts.slice(-2).join(".");
+  if (TWO_PART_TLDS.has(lastTwo) && parts.length <= 3) return false;
   return true;
 }
+
+const TWO_PART_TLDS = new Set([
+  'co.uk', 'com.au', 'co.jp', 'com.br', 'co.in', 'co.za', 'com.mx',
+  'org.uk', 'net.au', 'co.nz', 'com.sg', 'co.kr', 'com.hk', 'co.id'
+]);
 
 function getRootDomain(domain: string): string {
   const parts = domain.split(".");
   if (parts.length <= 2) return domain;
+  const lastTwo = parts.slice(-2).join(".");
+  if (TWO_PART_TLDS.has(lastTwo) && parts.length > 2) {
+    return parts.slice(-3).join(".");
+  }
   return parts.slice(-2).join(".");
 }
 
@@ -106,8 +118,8 @@ function formatNumber(str: string): number {
   if (cleaned.endsWith("K") || cleaned.endsWith("k")) return Math.round(parseFloat(cleaned) * 1000);
   if (cleaned.endsWith("M") || cleaned.endsWith("m")) return Math.round(parseFloat(cleaned) * 1_000_000);
   if (cleaned.endsWith("B") || cleaned.endsWith("b")) return Math.round(parseFloat(cleaned) * 1_000_000_000);
-  const num = parseInt(cleaned, 10);
-  return isNaN(num) ? 0 : num;
+  const num = parseFloat(cleaned);
+  return isNaN(num) ? 0 : Math.round(num);
 }
 
 function logStep(step: string, ...args: unknown[]) {
@@ -227,7 +239,8 @@ async function launchSemrushBrowser(): Promise<{ browser: Browser; context: Brow
   });
 
   // Block static resources to speed up page loads
-  await context.route('**/*.{png,jpg,jpeg,gif,svg,ico,webp,css,woff,woff2,ttf,eot,mp4,webm}',
+  // Note: CSS is NOT blocked because it's needed for isVisible() checks to work correctly
+  await context.route('**/*.{png,jpg,jpeg,gif,svg,ico,webp,woff,woff2,ttf,eot,mp4,webm}',
     async (route) => { await route.abort(); }
   );
 
@@ -644,7 +657,7 @@ async function semrushLogin(
 
         // Alternative: try clicking the "立即跳转" (redirect now) link
         try {
-          const redirectLink = gatewayPage.locator('text=立即跳转, text=跳转, a:has-text("跳转")').first();
+          const redirectLink = gatewayPage.locator('a:has-text("跳转"), a:has-text("立即跳转")').first();
           if ((await redirectLink.count()) > 0 && (await redirectLink.isVisible())) {
             await redirectLink.click();
             logStep("SEMrush-Login", "Clicked redirect link");
@@ -690,7 +703,7 @@ async function semrushLogin(
   // Click the 账号密码 (Account/Password) tab
   logStep("SEMrush-Login", "Clicking 账号密码 tab...");
   try {
-    const accTab = gatewayPage.locator('text=账号密码, [class*="tab"]:has-text("账号"), [role="tab"]:has-text("账号")').first();
+    const accTab = gatewayPage.locator('[class*="tab"]:has-text("账号"), [role="tab"]:has-text("账号"), a:has-text("账号密码"), button:has-text("账号密码"]').first();
     if ((await accTab.count()) > 0 && (await accTab.isVisible())) {
       await accTab.click();
       await gatewayPage.waitForTimeout(1000);
@@ -745,6 +758,20 @@ async function semrushLogin(
   const postLoginTitle = await gatewayPage.title().catch(() => "");
   logStep("SEMrush-Login", "After login, title:", postLoginTitle);
 
+  // ── Verify login succeeded ──
+  const postLoginUrl = gatewayPage.url();
+  const postLoginBody = await gatewayPage.locator('body').textContent().catch(() => "");
+  if (postLoginBody?.includes('密码错误') || postLoginBody?.includes('账号不存在') ||
+      postLoginBody?.includes('密码不正确') || postLoginBody?.includes('Invalid credentials') ||
+      postLoginBody?.includes('用户名或密码错误') || postLoginBody?.includes('登录失败')) {
+    throw new Error("Proxy dashboard login failed: incorrect card number or password");
+  }
+  // Check if we're still on a login form (login didn't succeed)
+  const stillHasPasswordInput = await gatewayPage.locator('input[type="password"]').count();
+  if (stillHasPasswordInput > 0 && (postLoginUrl.includes('login') || postLoginUrl.includes('signin'))) {
+    throw new Error("Proxy dashboard login failed: still on login page after submitting credentials");
+  }
+
   // ── Phase 3: Click "打开 Semrush" to open the SEMrush interface ──
   logStep("SEMrush-Login", "Phase 3: Clicking 打开 Semrush button...");
 
@@ -756,7 +783,7 @@ async function semrushLogin(
   const newPagePromise = context.waitForEvent('page', { timeout: 15000 }).catch(() => null);
 
   try {
-    const openBtn = gatewayPage.locator('text=打开 Semrush, text=打开 semrush, a:has-text("Semrush"), button:has-text("Semrush"), a:has-text("semrush"), [class*="semrush"]').first();
+    const openBtn = gatewayPage.locator('a:has-text("打开 Semrush"), button:has-text("打开 Semrush"), a:has-text("Semrush"), button:has-text("Semrush"), a:has-text("semrush"), [class*="semrush"]').first();
     if ((await openBtn.count()) > 0 && (await openBtn.isVisible())) {
       await openBtn.click();
       logStep("SEMrush-Login", "Clicked 打开 Semrush");
@@ -808,10 +835,11 @@ async function semrushLogin(
     logStep("SEMrush-Login", "New tab URL after stabilization:", stableUrl);
 
     // Check if the URL looks like a SEMrush proxy page
-    const newPageHost = new URL(stableUrl).hostname;
+    let newPageHost = '';
+    try { newPageHost = new URL(stableUrl).hostname; } catch { newPageHost = stableUrl; }
     if (newPageHost.includes("semrush") || newPageHost.includes("taobao-seo") || stableUrl.includes("/analytics/") || stableUrl.includes("/dashboard/")) {
       semrushPage = newPage;
-      semrushBaseUrl = new URL(stableUrl).protocol + "//" + new URL(stableUrl).host;
+      try { semrushBaseUrl = new URL(stableUrl).protocol + "//" + new URL(stableUrl).host; } catch { semrushBaseUrl = stableUrl; }
       logStep("SEMrush-Login", "Using new tab as SEMrush page, base URL:", semrushBaseUrl);
     } else {
       logStep("SEMrush-Login", "New tab URL doesn't look like SEMrush:", stableUrl);
@@ -856,7 +884,7 @@ async function semrushLogin(
     // Use the gateway page as the SEMrush page
     semrushPage = gatewayPage;
     const currentUrl = semrushPage.url();
-    semrushBaseUrl = new URL(currentUrl).protocol + "//" + new URL(currentUrl).host;
+    try { semrushBaseUrl = new URL(currentUrl).protocol + "//" + new URL(currentUrl).host; } catch { semrushBaseUrl = currentUrl; }
     logStep("SEMrush-Login", "Using gateway page as SEMrush page, base URL:", semrushBaseUrl);
   }
 
@@ -2047,7 +2075,7 @@ function extractTrafficFromApiData(capturedApiData: { url: string; body: any }[]
       const organicPatterns = [
         /"organic[^"]*traffic[^"]*":\s*"?([\d,.]+[KMB]?)"?/i,
         /"organic_search_traffic[^"]*":\s*(\d+)/i,
-        /"Ot[^"]*":\s*(\d+)/i,
+        /"Ot"\s*:\s*(\d+)/,  // Exact SEMrush short code for organic traffic
         /"OrganicTraffic[^"]*":\s*(\d+)/i,
       ];
       for (const pattern of organicPatterns) {
@@ -2065,7 +2093,7 @@ function extractTrafficFromApiData(capturedApiData: { url: string; body: any }[]
       const paidPatterns = [
         /"paid[^"]*traffic[^"]*":\s*"?([\d,.]+[KMB]?)"?/i,
         /"adwords[^"]*traffic[^"]*":\s*(\d+)/i,
-        /"Ad[^"]*":\s*(\d+)/i,
+        /"Ad"\s*:\s*(\d+)/,  // Exact SEMrush short code for paid traffic
         /"paid_search_traffic[^"]*":\s*(\d+)/i,
         /"PaidTraffic[^"]*":\s*(\d+)/i,
       ];
@@ -2152,9 +2180,10 @@ function extractTrafficFromApiData(capturedApiData: { url: string; body: any }[]
     }
   } else if (paidTraffic === 0 && organicTraffic > 0) {
     // If we don't have trend data but current paid traffic is 0 while organic exists,
-    // conservatively set warning (we can't confirm 6 months, but it's a signal)
-    paidTrafficWarning = true;
-    logStep("Traffic-API", "Paid traffic warning: current paid=0, organic>0, no trend data");
+    // we cannot confirm this is a brand bidding risk — the site may simply not run ads.
+    // Only set warning if we have evidence of previously active paid traffic.
+    paidTrafficWarning = false;
+    logStep("Traffic-API", "No paid traffic warning: current paid=0, organic>0, no trend data (site may not advertise)");
   }
   
   return { organicTraffic, paidTraffic, paidTrafficWarning };
@@ -2215,7 +2244,7 @@ async function navigateToSemrushPage(
 
       // Check for login redirect (session expired)
       const currentUrl = page.url();
-      if (pageTitle === "登录" || pageTitle === "Login" || currentUrl.includes("login")) {
+      if (pageTitle.includes("登录") || pageTitle.includes("Login") || currentUrl.includes("login")) {
         logStep("Navigate", "WARNING: On login page - session may have expired");
         return false;
       }
@@ -2434,6 +2463,7 @@ async function querySingleDomain(
     logStep("Query", `Completed: ${domain} (${bestCountry}) organic=${organicTraffic}, paid=${paidTraffic}, warning=${paidTrafficWarning}, keywords=${topKeywords.length}`);
     return { success: true, domain, country: bestCountry, isSubdomain: subDomain, organicTraffic, paidTraffic, paidTrafficWarning, topKeywords, rootDomainData };
   } catch (err) {
+    page.off('response', responseListener);  // Clean up listener on error
     const errMsg = err instanceof Error ? err.message : String(err);
     logStep("Query", `FAILED: ${domain} - ${errMsg}`);
     return { success: false, domain, country: initialCountry, isSubdomain: false, organicTraffic: 0, paidTraffic: 0, paidTrafficWarning: false, topKeywords: [], rootDomainData: null, error: errMsg };
@@ -2482,11 +2512,15 @@ async function handleSemrushDomain(req: Request): Promise<Response> {
     const errMsg = err instanceof Error ? err.message : String(err);
     logStep("SemrushDomain", `FAILED: ${errMsg}`);
 
-    if (errMsg.includes("login") || errMsg.includes("Login") || errMsg.includes("Could not find")) {
+    if (errMsg.includes("Proxy dashboard login failed") || errMsg.includes("Could not find username input") ||
+        errMsg.includes("Direct SEMrush login failed") || errMsg.includes("No password field visible")) {
       return jsonResponse({ success: false, error: "SEMrush login failed", details: errMsg }, 401);
     }
     if (errMsg.includes("Gateway page did not redirect")) {
       return jsonResponse({ success: false, error: "SEMrush gateway redirect failed", details: errMsg }, 502);
+    }
+    if (errMsg.includes("Could not find") && errMsg.includes("Semrush")) {
+      return jsonResponse({ success: false, error: "SEMrush dashboard navigation failed", details: errMsg }, 502);
     }
     return jsonResponse({ success: false, error: "SEMrush domain scraping failed", details: errMsg }, 500);
   }
@@ -2598,8 +2632,12 @@ async function handleSemrushAds(req: Request): Promise<Response> {
     const errMsg = err instanceof Error ? err.message : String(err);
     logStep("SemrushAds", `FAILED: ${errMsg}`);
 
-    if (errMsg.includes("login") || errMsg.includes("Login") || errMsg.includes("Could not find")) {
+    if (errMsg.includes("Proxy dashboard login failed") || errMsg.includes("Could not find username input") ||
+        errMsg.includes("Direct SEMrush login failed") || errMsg.includes("No password field visible")) {
       return jsonResponse({ success: false, error: "SEMrush login failed", details: errMsg }, 401);
+    }
+    if (errMsg.includes("Gateway page did not redirect")) {
+      return jsonResponse({ success: false, error: "SEMrush gateway redirect failed", details: errMsg }, 502);
     }
     return jsonResponse({ success: false, error: "SEMrush ad scraping failed", details: errMsg }, 500);
   }
