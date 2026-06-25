@@ -34,6 +34,10 @@ interface ExtractResult {
   finalUrl: string | null;
   validation?: ValidationResult;
   usedFallback: boolean;
+  // GAP-2: Hijack detection — set when a coupon-extension hijack domain is
+  // detected anywhere in the redirect chain / request URLs / final URL.
+  hijacked?: boolean;
+  hijackDomain?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +109,82 @@ function addRuntimeBlockedDomain(url: string): void {
       console.log(`[RouteBypass] Added runtime blocked domain: ${hostname}`);
     }
   } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// GAP-4: Unified domain classification
+// Replaces the old single salvageSkipDomains list that conflated valid
+// affiliate network domains with invalid beacon/iframe domains.
+// Three categories:
+//   1. AFFILIATE_NETWORK_DOMAINS — valid redirect middle domains. These ARE
+//      valid salvage candidates (attribution may have completed) and get +25
+//      bonus in scoreSalvageCandidate. buildBestResult keeps them as candidates.
+//   2. TRACKING_BEACON_DOMAINS — attribution pixels, NOT landing pages.
+//      Excluded from salvage candidates and buildBestResult terminal selection.
+//   3. THIRD_PARTY_IFRAME_DOMAINS — embedded widgets, NOT landing pages.
+//      Excluded from salvage candidates.
+// ---------------------------------------------------------------------------
+
+const AFFILIATE_NETWORK_DOMAINS = new Set([
+  'pxf.io', 'ojrq.net', 'sjv.io', 'impact.com', 'impactradius.com',
+  'avantlink.com', 'avantmetrics.com',
+  'linksynergy.com', 'go.skimresources.com', 'skimlinks.com',
+  'awin1.com', 'awin.com',
+  'shareasale.com', 'shareasale-analytics.com',
+  'prf.hn', 'partnerize.com',
+  'flexlinkspro.com', 'flexoffers.com',
+  'tkqlhce.com', 'apmebf.com', 'jdoqocy.com', 'kqzyfj.com', 'anrdoezrs.net',
+  'emjcd.com', 'www.emjcd.com',
+  'chinesean.com', 'tradetracker.net', 'effiliation.com',
+]);
+
+const TRACKING_BEACON_DOMAINS = new Set([
+  'doubleclick.net', 'googleadservices.com', 'adservice.google.com',
+  'googlesyndication.com', 'google-analytics.com', 'googletagmanager.com',
+  'connect.facebook.net', 'facebook.com', 'hotjar.com', 'segment.io',
+  'mixpanel.com', 'bat.bing.com', 'px.ads.linkedin.com',
+]);
+
+const THIRD_PARTY_IFRAME_DOMAINS = new Set([
+  'hsforms.com', 'sitescout.com', 'ipredictive.com', 'youtube.com',
+  'player.vimeo.com', 'wistia.com', 'cdn.optimizely.com',
+]);
+
+// Noise path patterns — Phase 4 JS redirect guard + salvage path penalty.
+// Matches policy/login/checkout pages that are NOT affiliate landing pages.
+const NOISE_PATH_PATTERNS = [
+  /^\/(privacy-policy|privacy|cookie-policy|cookies|terms|terms-of-service|tos)$/i,
+  /^\/(api|embed|tr|beacon|pixel|track|tracking)\//i,
+  /^\/(login|signup|account|cart|checkout)\//i,
+];
+
+function isAffiliateNetworkDomain(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  for (const d of AFFILIATE_NETWORK_DOMAINS) {
+    if (h === d || h.endsWith('.' + d)) return true;
+  }
+  return false;
+}
+
+function isTrackingBeaconDomain(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  for (const d of TRACKING_BEACON_DOMAINS) {
+    if (h === d || h.endsWith('.' + d)) return true;
+  }
+  return false;
+}
+
+function isThirdPartyIframeDomain(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  for (const d of THIRD_PARTY_IFRAME_DOMAINS) {
+    if (h === d || h.endsWith('.' + d)) return true;
+  }
+  return false;
+}
+
+function matchesNoisePath(pathname: string): boolean {
+  const p = pathname.toLowerCase();
+  return NOISE_PATH_PATTERNS.some(re => re.test(p));
 }
 
 // ---------------------------------------------------------------------------
@@ -555,20 +635,26 @@ function scoreUrl(url: string, affiliateLink: string, affiliateNetwork?: string)
 async function nodeJsFollowRedirects(
   startUrl: string,
   maxRedirects = 10,
+  referer?: string,
 ): Promise<{ url: string | null; redirectChain: string[] }> {
   const redirectChain: string[] = [];
   let currentUrl = startUrl;
 
   for (let i = 0; i < maxRedirects; i++) {
     try {
+      // GAP-5: Forward Referer to HTTP fallback so attribution pixels that
+      // check Referer header still fire correctly when browser path fails.
+      const headers: Record<string, string> = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+      };
+      if (referer) headers['Referer'] = referer;
+
       const response = await fetch(currentUrl, {
         redirect: 'manual',
         signal: AbortSignal.timeout(15000),
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
-        },
+        headers,
       });
 
       if ([301, 302, 303, 307, 308].includes(response.status)) {
@@ -768,6 +854,200 @@ function throwIfAborted(signal?: AbortSignal): void {
 }
 
 // ---------------------------------------------------------------------------
+// GAP-1: Multi-signal salvage candidate scoring
+// Replaces the old "take last valid candidate" heuristic that selected
+// iframe/beacon URLs and rewarded mid-redirect hops by host frequency.
+// ---------------------------------------------------------------------------
+
+/**
+ * Derive the most likely landing domain from the redirect chain.
+ * Heuristic: the last non-affiliate-network, non-beacon, non-iframe domain
+ * in the chain is most likely the real landing domain.
+ * Returns '' if no hint can be derived.
+ */
+function deriveLandingDomainHint(redirectChain: string[]): string {
+  for (let i = redirectChain.length - 1; i >= 0; i--) {
+    try {
+      const host = new URL(redirectChain[i]).hostname.toLowerCase();
+      if (!host) continue;
+      if (isAffiliateNetworkDomain(host)) continue;
+      if (isTrackingBeaconDomain(host)) continue;
+      if (isThirdPartyIframeDomain(host)) continue;
+      // Strip subdomain to get registrable domain (rough heuristic)
+      const parts = host.split('.');
+      if (parts.length >= 2) {
+        return parts.slice(-2).join('.');
+      }
+      return host;
+    } catch {}
+  }
+  return '';
+}
+
+/**
+ * Score a salvage candidate URL using 6 signals.
+ * Threshold: score >= 40 to be accepted as salvage result.
+ *
+ * Signal 0 (bonus): Landing domain match — +60
+ *   hostname's registrable domain === landingDomainHint
+ * Signal 1: Injected tracking param — +50
+ *   URL contains any ALL_KNOWN_TRACKING_PARAMS
+ * Signal 2: Tracking ID shape — +20
+ *   Some param value len>=10 and contains both letters and digits
+ * Signal 3: Hostname frequency — +5 per occurrence (cap 25)
+ *   How many times this hostname appears in allCandidates
+ * Signal 4: Non-noise domain — +30
+ *   Not in TRACKING_BEACON ∪ THIRD_PARTY_IFRAME, path doesn't match NOISE_PATH
+ * Signal 5: Landing page path shape — +20
+ *   pathname matches /, /en(-us)?, /collections/, /products/, /p/, /item/, /dp/
+ * Signal 6: Affiliate network domain — +25
+ *   hostname in AFFILIATE_NETWORK_DOMAINS
+ */
+function scoreSalvageCandidate(
+  url: string,
+  allCandidates: string[],
+  landingDomainHint: string,
+): number {
+  let score = 0;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return 0;
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  const pathname = parsed.pathname.toLowerCase();
+
+  // Signal 0: Landing domain bonus
+  if (landingDomainHint) {
+    const parts = hostname.split('.');
+    const registrable = parts.length >= 2 ? parts.slice(-2).join('.') : hostname;
+    if (registrable === landingDomainHint) {
+      score += 60;
+    }
+  }
+
+  // Signal 1: Injected tracking param
+  let hasKnownParam = false;
+  for (const param of ALL_KNOWN_TRACKING_PARAMS) {
+    if (parsed.searchParams.has(param)) {
+      hasKnownParam = true;
+      break;
+    }
+  }
+  if (hasKnownParam) score += 50;
+
+  // Signal 2: Tracking ID shape (len>=10, has letters + digits)
+  let hasTrackingIdShape = false;
+  for (const [, value] of parsed.searchParams.entries()) {
+    if (value.length >= 10 && /\d/.test(value) && /[a-zA-Z]/.test(value)) {
+      hasTrackingIdShape = true;
+      break;
+    }
+  }
+  if (hasTrackingIdShape) score += 20;
+
+  // Signal 3: Hostname frequency (cap 25)
+  let hostCount = 0;
+  for (const candidate of allCandidates) {
+    try {
+      if (new URL(candidate).hostname.toLowerCase() === hostname) {
+        hostCount++;
+      }
+    } catch {}
+  }
+  score += Math.min(hostCount * 5, 25);
+
+  // Signal 4: Non-noise domain
+  const isBeacon = isTrackingBeaconDomain(hostname);
+  const isIframe = isThirdPartyIframeDomain(hostname);
+  const isNoisePath = matchesNoisePath(pathname);
+  if (!isBeacon && !isIframe && !isNoisePath) {
+    score += 30;
+  }
+
+  // Signal 5: Landing page path shape
+  const landingPathPatterns = [
+    /^\/$/, /^\/en(-us)?$/i, /^\/collections\//i, /^\/products\//i,
+    /^\/p\//i, /^\/item\//i, /^\/dp\//i, /^\/[a-z]{2}(-[a-z]{2})?$/i,
+  ];
+  if (landingPathPatterns.some(re => re.test(pathname))) {
+    score += 20;
+  }
+
+  // Signal 6: Affiliate network domain
+  if (isAffiliateNetworkDomain(hostname)) {
+    score += 25;
+  }
+
+  return score;
+}
+
+// ---------------------------------------------------------------------------
+// GAP-2: Hijack detection (coupon browser extensions etc.)
+// ---------------------------------------------------------------------------
+
+const HIJACK_DOMAINS = ['fatcoupon.com', 'couponfollow.com', 'honey.is', 'honey.io'];
+
+/**
+ * Detect hijack by coupon-style browser extensions.
+ * These extensions intercept redirect chains and inject their own affiliate
+ * links. Must scan redirectChain + allRequestUrls + finalUrl because the
+ * hijack may appear at any point, not just the terminal URL.
+ *
+ * Returns the hijack domain if detected, null otherwise.
+ */
+function detectHijack(
+  redirectChain: string[],
+  allRequestUrls: string[],
+  finalUrl: string,
+): string | null {
+  const allUrls = [...redirectChain, ...allRequestUrls];
+  if (finalUrl) allUrls.push(finalUrl);
+  for (const url of allUrls) {
+    try {
+      const host = new URL(url).hostname.toLowerCase();
+      for (const hijack of HIJACK_DOMAINS) {
+        if (host === hijack || host.endsWith('.' + hijack)) {
+          return hijack;
+        }
+      }
+    } catch {}
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// GAP-3: Phase 4 JS redirect noise guard
+// ---------------------------------------------------------------------------
+
+/**
+ * Guard for Phase 4 JS redirect / meta refresh / iframe URLs.
+ * Rejects:
+ *   - Same-origin URLs (relative redirects that loop back to affiliate site)
+ *   - Noise paths (privacy-policy, login, checkout, etc.)
+ *   - Impact policy/legal/privacy pages
+ * Returns true if the URL should be REJECTED (is noise).
+ */
+function isNoiseJsRedirect(rawUrl: string, pageOrigin: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl, pageOrigin);
+  } catch {
+    return true; // Unparseable → reject
+  }
+  // Reject same-origin (loops back to affiliate site, not a real landing)
+  if (pageOrigin && parsed.origin === pageOrigin) return true;
+  const path = parsed.pathname.toLowerCase();
+  if (matchesNoisePath(path)) return true;
+  // Reject Impact policy/legal pages
+  if (/(^|\.)impact\.com$/.test(parsed.hostname) && /policy|privacy|legal/.test(path)) {
+    return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // Build best result from redirect chain using scoring
 // ---------------------------------------------------------------------------
 
@@ -782,15 +1062,28 @@ function buildBestResult(
   const normalizedChain = redirectChain.map(u => normalizeTrackingParams(u));
   const normalizedCurrent = normalizeTrackingParams(currentUrl);
 
-  // Build candidate URLs (deduplicated, excluding affiliate link and chrome errors)
+  // Build candidate URLs (deduplicated, excluding affiliate link, chrome errors,
+  // and GAP-4: exclude tracking beacon + third-party iframe domains which are
+  // never real landing pages. Affiliate network domains are KEPT as candidates
+  // because attribution may have completed and the URL is still on a network
+  // domain — scoreUrl will rank them appropriately.)
   const candidateUrls = new Map<string, number>();
   for (const url of normalizedChain) {
     if (!isSameUrl(url, affiliateLink) && !isChromeError(url) && !candidateUrls.has(url)) {
+      try {
+        const host = new URL(url).hostname.toLowerCase();
+        if (isTrackingBeaconDomain(host) || isThirdPartyIframeDomain(host)) continue;
+      } catch { continue; }
       candidateUrls.set(url, scoreUrl(url, affiliateLink, affiliateNetwork));
     }
   }
   if (!isSameUrl(normalizedCurrent, affiliateLink) && !isChromeError(normalizedCurrent) && !candidateUrls.has(normalizedCurrent)) {
-    candidateUrls.set(normalizedCurrent, scoreUrl(normalizedCurrent, affiliateLink, affiliateNetwork));
+    try {
+      const host = new URL(normalizedCurrent).hostname.toLowerCase();
+      if (!isTrackingBeaconDomain(host) && !isThirdPartyIframeDomain(host)) {
+        candidateUrls.set(normalizedCurrent, scoreUrl(normalizedCurrent, affiliateLink, affiliateNetwork));
+      }
+    } catch {}
   }
 
   // Pick the best URL (highest score), fallback to currentUrl if no candidates
@@ -911,6 +1204,20 @@ async function extractOnce(
 
     // Early exit if Phase 1.5 found a landing page
     if (!isSameUrl(currentUrl, affiliateLink) && !isChromeError(currentUrl)) {
+      // GAP-2: Hijack detection before accepting
+      const hijackDomain = detectHijack(redirectChain, allRequestUrls, currentUrl);
+      if (hijackDomain) {
+        console.warn(`[Extract] Hijack detected (Phase 1.5): ${hijackDomain}`);
+        return {
+          success: false,
+          landingPageUrl: null,
+          redirectChain: redirectChain.map(u => normalizeTrackingParams(u)),
+          finalUrl: currentUrl,
+          usedFallback: false,
+          hijacked: true,
+          hijackDomain,
+        };
+      }
       return buildBestResult(currentUrl, redirectChain, affiliateLink, affiliateNetwork, false);
     }
 
@@ -936,13 +1243,21 @@ async function extractOnce(
     throwIfAborted(signal);
 
     // ── Phase 4: Parse page content for redirect URLs ──
+    // GAP-3: All three branches (meta refresh / JS redirect / iframe) are
+    // guarded by isNoiseJsRedirect to reject same-origin loops, noise paths
+    // (privacy-policy, login, checkout), and Impact policy pages. Without
+    // this guard, Phase 4 would navigate to /privacy-policy etc. and capture
+    // those as the landing page.
     if (isSameUrl(currentUrl, affiliateLink) || isChromeError(currentUrl)) {
+      let pageOrigin = '';
+      try { pageOrigin = new URL(affiliateLink).origin; } catch {}
+
       const metaRefreshUrl = await page.evaluate(() => {
         const meta = document.querySelector('meta[http-equiv="refresh"]');
         if (meta) { const match = (meta.getAttribute("content") || "").match(/url=(.+)/i); return match ? match[1].trim() : null; }
         return null;
       });
-      if (metaRefreshUrl) {
+      if (metaRefreshUrl && pageOrigin && !isNoiseJsRedirect(metaRefreshUrl, pageOrigin)) {
         throwIfAborted(signal);
         try { await page.goto(metaRefreshUrl, { waitUntil: "load", timeout: 60000 }); currentUrl = page.url(); } catch {}
       }
@@ -958,7 +1273,7 @@ async function extractOnce(
           }
           return null;
         });
-        if (jsRedirectUrl) {
+        if (jsRedirectUrl && pageOrigin && !isNoiseJsRedirect(jsRedirectUrl, pageOrigin)) {
           throwIfAborted(signal);
           try { await page.goto(jsRedirectUrl, { waitUntil: "load", timeout: 60000 }); currentUrl = page.url(); } catch {}
         }
@@ -966,7 +1281,7 @@ async function extractOnce(
 
       if (isSameUrl(currentUrl, affiliateLink) || isChromeError(currentUrl)) {
         const iframeUrl = await page.evaluate(() => { const iframe = document.querySelector("iframe[src]"); return iframe ? iframe.getAttribute("src") : null; });
-        if (iframeUrl && iframeUrl.startsWith("http")) {
+        if (iframeUrl && iframeUrl.startsWith("http") && pageOrigin && !isNoiseJsRedirect(iframeUrl, pageOrigin)) {
           throwIfAborted(signal);
           try { await page.goto(iframeUrl, { waitUntil: "load", timeout: 60000 }); currentUrl = page.url(); } catch {}
         }
@@ -982,38 +1297,68 @@ async function extractOnce(
 
     // If Playwright found a landing page, score and validate
     if (!isSameUrl(currentUrl, affiliateLink) && !isChromeError(currentUrl)) {
+      // GAP-2: Hijack detection before accepting
+      const hijackDomain = detectHijack(redirectChain, allRequestUrls, currentUrl);
+      if (hijackDomain) {
+        console.warn(`[Extract] Hijack detected (Phase 2-5): ${hijackDomain}`);
+        return {
+          success: false,
+          landingPageUrl: null,
+          redirectChain: redirectChain.map(u => normalizeTrackingParams(u)),
+          finalUrl: currentUrl,
+          usedFallback: false,
+          hijacked: true,
+          hijackDomain,
+        };
+      }
       return buildBestResult(currentUrl, redirectChain, affiliateLink, affiliateNetwork, false);
     }
 
-    // ── URL Salvage (P0-2 fallback) ──
+    // ── URL Salvage (P0-2 fallback, GAP-1 multi-signal scoring) ──
     // 5 phases all failed but page.url() still on affiliate link. Don't give up —
-    // salvage from allRequestUrls (browser may have actually visited the landing
-    // page but URL rebound due to HTTP/2 load failure). Attribution is preserved
+    // salvage from allRequestUrls using 6-signal scoring (was: take last valid
+    // candidate, which selected iframe/beacon URLs). Attribution is preserved
     // (browser visited the URL, cookies written).
     if (allRequestUrls.length > 0) {
-      console.log(`[Extract] URL salvage: trying ${allRequestUrls.length} captured request URLs`);
-      const salvageSkipDomains = [
-        'sjv.io', 'ojrq.net', 'linksynergy.com', 'awin1.com', 'awin.com',
-        'shareasale.com', 'avantlink.com', 'prf.hn', 'partnerize.com',
-        'flexlinkspro.com', 'chinesean.com', 'doubleclick.net',
-        'googleadservices.com', 'adservice.google.com', 'googlesyndication.com',
-        'google-analytics.com', 'googletagmanager.com', 'facebook.com',
-      ];
-      const validCandidates = allRequestUrls.filter(u =>
-        !isSameUrl(u, affiliateLink) &&
-        !isChromeError(u) &&
-        (() => {
-          try {
-            const host = new URL(u).hostname.toLowerCase();
-            return !salvageSkipDomains.some(d => host === d || host.endsWith('.' + d));
-          } catch { return false; }
-        })()
-      );
+      console.log(`[Extract] URL salvage: scoring ${allRequestUrls.length} captured request URLs`);
+      // Filter candidates: exclude affiliate link itself, chrome errors, beacons, iframes
+      const validCandidates = allRequestUrls.filter(u => {
+        if (isSameUrl(u, affiliateLink)) return false;
+        if (isChromeError(u)) return false;
+        try {
+          const host = new URL(u).hostname.toLowerCase();
+          if (isTrackingBeaconDomain(host)) return false;
+          if (isThirdPartyIframeDomain(host)) return false;
+          return true;
+        } catch {
+          return false;
+        }
+      });
       if (validCandidates.length > 0) {
-        // Take the last valid candidate (deepest in redirect chain = real landing)
-        const salvagedUrl = validCandidates[validCandidates.length - 1];
-        console.log(`[Extract] URL salvage success: ${salvagedUrl}`);
-        return buildBestResult(salvagedUrl, redirectChain, affiliateLink, affiliateNetwork, false);
+        const landingDomainHint = deriveLandingDomainHint(redirectChain);
+        const scored = validCandidates
+          .map(u => ({ url: u, score: scoreSalvageCandidate(u, validCandidates, landingDomainHint) }))
+          .filter(x => x.score >= 40)
+          .sort((a, b) => b.score - a.score);
+        if (scored.length > 0) {
+          console.log(`[Extract] URL salvage success: ${scored[0].url} (score=${scored[0].score})`);
+          // GAP-2: Hijack detection before accepting salvaged URL
+          const hijackDomain = detectHijack(redirectChain, allRequestUrls, scored[0].url);
+          if (hijackDomain) {
+            console.warn(`[Extract] Hijack detected (salvage): ${hijackDomain}`);
+            return {
+              success: false,
+              landingPageUrl: null,
+              redirectChain: redirectChain.map(u => normalizeTrackingParams(u)),
+              finalUrl: scored[0].url,
+              usedFallback: false,
+              hijacked: true,
+              hijackDomain,
+            };
+          }
+          return buildBestResult(scored[0].url, redirectChain, affiliateLink, affiliateNetwork, false);
+        }
+        console.warn(`[Extract] URL salvage: no candidate scored >= 40 (${validCandidates.length} candidates tried)`);
       }
     }
 
@@ -1021,7 +1366,9 @@ async function extractOnce(
     console.log("[Extract] Playwright + salvage failed, trying HTTP fallback...");
     throwIfAborted(signal);
     try {
-      const fallbackResult = await nodeJsFollowRedirects(affiliateLink);
+      // GAP-5: Forward referer to HTTP fallback so attribution pixels that
+      // check Referer header still fire correctly when browser path fails.
+      const fallbackResult = await nodeJsFollowRedirects(affiliateLink, 10, referer);
       if (fallbackResult.url) {
         const mergedChain = [...redirectChain, ...fallbackResult.redirectChain];
         const normalizedUrl = normalizeTrackingParams(fallbackResult.url);
@@ -1085,6 +1432,23 @@ async function handleExtract(req: Request): Promise<Response> {
   try {
     const result = await extractOnce(url, proxy, affiliateNetwork, referer);
     const elapsed = Date.now() - startTime;
+
+    // GAP-2: Hijack detected → 422 with specific error code so client can
+    // show a friendly "check your browser extensions" message instead of
+    // treating the hijacked URL as a real landing page.
+    if (result.hijacked) {
+      console.warn(`[Extract] Hijack detected in ${elapsed}ms: ${result.hijackDomain}`);
+      return jsonResponse({
+        success: false,
+        error: `检测到劫持域名 ${result.hijackDomain}，请检查浏览器插件`,
+        errorCode: "HIJACKED",
+        hijackDomain: result.hijackDomain,
+        redirectChain: result.redirectChain,
+        finalUrl: result.finalUrl,
+        elapsed,
+      }, 422);
+    }
+
     console.log(`[Extract] Completed in ${elapsed}ms — success=${result.success}, usedFallback=${result.usedFallback}, redirectChain=${result.redirectChain.length} hops`);
     return jsonResponse({
       success: result.success,
