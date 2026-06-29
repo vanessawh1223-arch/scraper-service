@@ -1,12 +1,5 @@
 import { chromium, type Browser, type BrowserContext, type Page, type Route } from "playwright";
-import { chromium as chromiumExtra } from "playwright-extra";
-import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { createServer, IncomingMessage, ServerResponse } from "http";
-
-// Apply stealth plugin to playwright-extra (covers 30+ fingerprint vectors:
-// webdriver, chrome runtime, permissions, navigator plugins, languages,
-// WebGL vendor, Canvas noise, AudioContext, hardwareConcurrency, etc.)
-chromiumExtra.use(StealthPlugin());
 
 // ---------------------------------------------------------------------------
 // Types
@@ -17,8 +10,11 @@ interface ExtractRequest {
   proxy?: string;
   timeout?: number;
   affiliateNetwork?: string;
-  referer?: string; // Preset Referer from Settings (overrides deriveReferer)
+  referer?: string;
 }
+
+type FailureType = 'hijacked' | 'incompleteExtraction' | 'noAttributionParams';
+type Confidence = 'high' | 'medium' | 'low';
 
 interface ValidationResult {
   valid: boolean;
@@ -34,294 +30,11 @@ interface ExtractResult {
   finalUrl: string | null;
   validation?: ValidationResult;
   usedFallback: boolean;
-  // GAP-2: Hijack detection — set when a coupon-extension hijack domain is
-  // detected anywhere in the redirect chain / request URLs / final URL.
-  hijacked?: boolean;
-  hijackDomain?: string;
+  failureType?: FailureType;
+  hijackedDomain?: string;
+  confidence?: Confidence;
+  signature?: string;
 }
-
-// ---------------------------------------------------------------------------
-// Configuration Constants
-// ---------------------------------------------------------------------------
-
-// Browser pool: reuse browser instances per proxy to avoid cold-start overhead.
-// Default 3 (covers batch CONCURRENCY=3 with different proxies). Configurable
-// via BROWSER_POOL_MAX env var. Each Chromium instance ~150-300MB; 512MB
-// container should not exceed 3-4 instances.
-const BROWSER_POOL_MAX = parseInt(process.env.BROWSER_POOL_MAX || '3', 10);
-
-// Idle timeout: close browser after 60s of no use to free memory
-const BROWSER_IDLE_TIMEOUT_MS = 60_000;
-
-// Leak detection: if inUse > 0 and idle > 5min, force-reset the counter
-// (handles cases where tasks crashed without releasing)
-const BROWSER_LEAK_THRESHOLD_MS = 5 * 60_000;
-
-// Watchdog: hard kill the process after 6 minutes to let Railway restart
-// (prevents drift from accumulated leaks)
-const WATCHDOG_TIMEOUT_MS = 6 * 60_000;
-
-// Extractor timeout: single extraction attempt must complete in 90s
-const EXTRACTOR_TIMEOUT_MS = 90_000;
-
-// Dynamic domain list for route.fetch() bypass — domains that fail under
-// browser native stack (Chromium SubresourceFilter block or HTTP/2 errors)
-// get re-fetched via Playwright HTTP client (HTTP/1.1).
-const SUBRESOURCE_BLOCKED_DOMAINS = new Set<string>([
-  // Category 1: Affiliate redirect middle domains (Chromium blocks these)
-  'linksynergy.com', 'click.linksynergy.com',
-  'pxf.io', 'impact.com', 'impactradius.com',
-  'tkqlhce.com', 'apmebf.com', 'jdoqocy.com', 'kqzyfj.com',
-  'anrdoezrs.net', 'emjcd.com',
-  'shareasale.com', 'shareasale-analytics.com',
-  'awin1.com', 'awin.com',
-  'avantlink.com', 'avantmetrics.com',
-  'prf.hn', 'partnerize.com',
-  'redirectingat.com', 'go.redirectingat.com',
-  't.cfjump.com',
-  // Category 2: Known HTTP/2 + proxy incompatible landing pages
-  'frenchbee.com',
-]);
-
-// Domains learned at runtime (added when ERR_HTTP2_PROTOCOL_ERROR detected)
-const runtimeBlockedDomains = new Set<string>();
-
-function isSubresourceBlockedDomain(url: string): boolean {
-  try {
-    const hostname = new URL(url).hostname.toLowerCase();
-    for (const blocked of SUBRESOURCE_BLOCKED_DOMAINS) {
-      if (hostname === blocked || hostname.endsWith('.' + blocked)) return true;
-    }
-    for (const blocked of runtimeBlockedDomains) {
-      if (hostname === blocked || hostname.endsWith('.' + blocked)) return true;
-    }
-    return false;
-  } catch {
-    return false;
-  }
-}
-
-function addRuntimeBlockedDomain(url: string): void {
-  try {
-    const hostname = new URL(url).hostname.toLowerCase();
-    if (hostname && !SUBRESOURCE_BLOCKED_DOMAINS.has(hostname)) {
-      runtimeBlockedDomains.add(hostname);
-      console.log(`[RouteBypass] Added runtime blocked domain: ${hostname}`);
-    }
-  } catch {}
-}
-
-// ---------------------------------------------------------------------------
-// GAP-4: Unified domain classification
-// Replaces the old single salvageSkipDomains list that conflated valid
-// affiliate network domains with invalid beacon/iframe domains.
-// Three categories:
-//   1. AFFILIATE_NETWORK_DOMAINS — valid redirect middle domains. These ARE
-//      valid salvage candidates (attribution may have completed) and get +25
-//      bonus in scoreSalvageCandidate. buildBestResult keeps them as candidates.
-//   2. TRACKING_BEACON_DOMAINS — attribution pixels, NOT landing pages.
-//      Excluded from salvage candidates and buildBestResult terminal selection.
-//   3. THIRD_PARTY_IFRAME_DOMAINS — embedded widgets, NOT landing pages.
-//      Excluded from salvage candidates.
-// ---------------------------------------------------------------------------
-
-const AFFILIATE_NETWORK_DOMAINS = new Set([
-  'pxf.io', 'ojrq.net', 'sjv.io', 'impact.com', 'impactradius.com',
-  'avantlink.com', 'avantmetrics.com',
-  'linksynergy.com', 'go.skimresources.com', 'skimlinks.com',
-  'awin1.com', 'awin.com',
-  'shareasale.com', 'shareasale-analytics.com',
-  'prf.hn', 'partnerize.com',
-  'flexlinkspro.com', 'flexoffers.com',
-  'tkqlhce.com', 'apmebf.com', 'jdoqocy.com', 'kqzyfj.com', 'anrdoezrs.net',
-  'emjcd.com', 'www.emjcd.com',
-  'chinesean.com', 'tradetracker.net', 'effiliation.com',
-]);
-
-const TRACKING_BEACON_DOMAINS = new Set([
-  'doubleclick.net', 'googleadservices.com', 'adservice.google.com',
-  'googlesyndication.com', 'google-analytics.com', 'googletagmanager.com',
-  'connect.facebook.net', 'facebook.com', 'hotjar.com', 'segment.io',
-  'mixpanel.com', 'bat.bing.com', 'px.ads.linkedin.com',
-]);
-
-const THIRD_PARTY_IFRAME_DOMAINS = new Set([
-  'hsforms.com', 'sitescout.com', 'ipredictive.com', 'youtube.com',
-  'player.vimeo.com', 'wistia.com', 'cdn.optimizely.com',
-]);
-
-// Noise path patterns — Phase 4 JS redirect guard + salvage path penalty.
-// Matches policy/login/checkout pages that are NOT affiliate landing pages.
-const NOISE_PATH_PATTERNS = [
-  /^\/(privacy-policy|privacy|cookie-policy|cookies|terms|terms-of-service|tos)$/i,
-  /^\/(api|embed|tr|beacon|pixel|track|tracking)\//i,
-  /^\/(login|signup|account|cart|checkout)\//i,
-];
-
-function isAffiliateNetworkDomain(hostname: string): boolean {
-  const h = hostname.toLowerCase();
-  for (const d of AFFILIATE_NETWORK_DOMAINS) {
-    if (h === d || h.endsWith('.' + d)) return true;
-  }
-  return false;
-}
-
-function isTrackingBeaconDomain(hostname: string): boolean {
-  const h = hostname.toLowerCase();
-  for (const d of TRACKING_BEACON_DOMAINS) {
-    if (h === d || h.endsWith('.' + d)) return true;
-  }
-  return false;
-}
-
-function isThirdPartyIframeDomain(hostname: string): boolean {
-  const h = hostname.toLowerCase();
-  for (const d of THIRD_PARTY_IFRAME_DOMAINS) {
-    if (h === d || h.endsWith('.' + d)) return true;
-  }
-  return false;
-}
-
-function matchesNoisePath(pathname: string): boolean {
-  const p = pathname.toLowerCase();
-  return NOISE_PATH_PATTERNS.some(re => re.test(p));
-}
-
-// ---------------------------------------------------------------------------
-// Browser Pool (P0-1: reuse browser instances per proxy)
-// ---------------------------------------------------------------------------
-
-interface BrowserInstance {
-  browser: Browser;
-  proxyUrl: string;
-  inUse: number;
-  lastUsedAt: number;
-}
-
-class BrowserPool {
-  private pool = new Map<string, BrowserInstance>();
-  private cleanupTimer: NodeJS.Timeout | null = null;
-
-  constructor() {
-    // Run cleanup every 30s
-    this.cleanupTimer = setInterval(() => this.cleanup(), 30_000);
-    // Don't keep process alive just for cleanup
-    if (this.cleanupTimer.unref) this.cleanupTimer.unref();
-  }
-
-  async acquire(proxyUrl: string): Promise<BrowserInstance> {
-    const key = proxyUrl || '__no_proxy__';
-
-    let instance = this.pool.get(key);
-    if (instance) {
-      // Reuse existing instance — wait if currently in use (serialize same-proxy requests)
-      while (instance.inUse > 0) {
-        await new Promise(resolve => setTimeout(resolve, 50));
-        // Re-check (instance might have been closed by cleanup)
-        instance = this.pool.get(key);
-        if (!instance) {
-          // Was cleaned up; create a new one
-          return this.acquire(proxyUrl);
-        }
-      }
-      instance.inUse = 1;
-      instance.lastUsedAt = Date.now();
-      return instance;
-    }
-
-    // At pool capacity? Evict the oldest idle instance
-    if (this.pool.size >= BROWSER_POOL_MAX) {
-      this.evictOldestIdle();
-    }
-
-    // Launch new browser
-    const browser = await this.launchBrowserInternal(proxyUrl);
-    instance = {
-      browser,
-      proxyUrl,
-      inUse: 1,
-      lastUsedAt: Date.now(),
-    };
-    this.pool.set(key, instance);
-    return instance;
-  }
-
-  release(instance: BrowserInstance): void {
-    instance.inUse = Math.max(0, instance.inUse - 1);
-    instance.lastUsedAt = Date.now();
-  }
-
-  private async launchBrowserInternal(proxyUrl: string): Promise<Browser> {
-    const launchOptions: Record<string, unknown> = {
-      headless: true,
-      ignoreDefaultArgs: ["--enable-automation"],
-      args: [
-        "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
-        "--disable-gpu", "--disable-blink-features=AutomationControlled",
-        "--disable-features=SubresourceFilter,SafeBrowsing",
-        "--disable-web-security", "--disable-extensions", "--no-first-run",
-        "--js-flags=--max-old-space-size=256", "--disable-soft-reload",
-        "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
-        "--disable-renderer-backgrounding", "--disable-ipc-flooding-protection",
-      ],
-    };
-    if (proxyUrl) launchOptions.proxy = parseProxy(proxyUrl);
-    // Use playwright-extra (with stealth plugin) instead of vanilla chromium
-    return await chromiumExtra.launch(launchOptions);
-  }
-
-  private cleanup(): void {
-    const now = Date.now();
-    for (const [key, instance] of this.pool) {
-      const idleMs = now - instance.lastUsedAt;
-      if (instance.inUse > 0) {
-        // Leak detection: inUse>0 but idle for too long → force reset
-        if (idleMs > BROWSER_LEAK_THRESHOLD_MS) {
-          console.warn(`[BrowserPool] Leak detected: ${key} inUse=${instance.inUse} idle=${idleMs}ms, force-resetting`);
-          instance.inUse = 0;
-        }
-        continue;
-      }
-      // Idle and not in use → close after timeout
-      if (idleMs > BROWSER_IDLE_TIMEOUT_MS) {
-        console.log(`[BrowserPool] Closing idle browser: ${key} (idle ${idleMs}ms)`);
-        instance.browser.close().catch(() => {});
-        this.pool.delete(key);
-      }
-    }
-  }
-
-  private evictOldestIdle(): void {
-    let oldestKey: string | null = null;
-    let oldestTime = Infinity;
-    for (const [key, instance] of this.pool) {
-      if (instance.inUse === 0 && instance.lastUsedAt < oldestTime) {
-        oldestTime = instance.lastUsedAt;
-        oldestKey = key;
-      }
-    }
-    if (oldestKey) {
-      const instance = this.pool.get(oldestKey);
-      if (instance) {
-        console.log(`[BrowserPool] Evicting oldest idle: ${oldestKey}`);
-        instance.browser.close().catch(() => {});
-        this.pool.delete(oldestKey);
-      }
-    }
-  }
-
-  getStats() {
-    let inUse = 0;
-    let idle = 0;
-    for (const instance of this.pool.values()) {
-      if (instance.inUse > 0) inUse++;
-      else idle++;
-    }
-    return { poolSize: this.pool.size, inUse, idle, max: BROWSER_POOL_MAX };
-  }
-}
-
-const browserPool = new BrowserPool();
 
 // ---------------------------------------------------------------------------
 // Affiliate Tracking Parameters Dictionary
@@ -344,6 +57,76 @@ const GENERIC_ANALYTICS_PARAMS = new Set([
   'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
   'gclid', 'gclsrc', 'dclid', 'ref', 'lang', 'locale',
 ]);
+
+// ---------------------------------------------------------------------------
+// Domain classification tables (hard filter for noise URLs)
+// ---------------------------------------------------------------------------
+
+/** Category 0 — Browser extension hijack domains (permanent failure trigger) */
+const HIJACK_DOMAINS = new Set([
+  'fatcoupon.com', 'www.fatcoupon.com',
+  'couponfollow.com', 'www.couponfollow.com',
+  'honey.com', 'www.honey.com', 'joinhoney.com',
+  'wikibuy.com', 'www.wikibuy.com',
+  'paypal-hero.com', 'www.paypal-hero.com',
+  'pandadl.com', 'www.pandadl.com',
+  'c2d.to', 'www.c2d.to',
+  'couponcinema.com', 'www.couponcinema.com',
+]);
+
+/** Category A — Affiliate redirect middle pages */
+const AFFILIATE_REDIRECT_DOMAINS = new Set([
+  'sjv.io', 'www.svj.io',
+  'ojrq.net', 'www.ojrq.net',
+  'pxf.io', 'www.pxf.io',
+  'avantlink.com', 'www.avantlink.com',
+  'flexlinkspro.com', 'www.flexlinkspro.com',
+  'go.skimresources.com', 'skimresources.com',
+  'tkqlhce.com', 'www.tkqlhce.com',
+  'anrdoezrs.net', 'www.anrdoezrs.net',
+  'kqzyfj.com', 'www.kqzyfj.com',
+  'jdoqocy.com', 'www.jdoqocy.com',
+  'dpbolvw.net', 'www.dpbolvw.net',
+  'linksynergy.com', 'www.linksynergy.com',
+  'commission-junction.com',
+]);
+
+/** Category B — Third-party iframe / SDK / beacon domains */
+const IFRAME_SDK_DOMAINS = new Set([
+  'youtube.com', 'www.youtube.com',
+  'accounts.google.com', 'accounts.gstatic.com',
+  'hsforms.net', 'www.hsforms.net',
+  'jst.ai', 'www.jst.ai',
+  'shop.app', 'www.shop.app',
+  'cookiebot.com', 'www.cookiebot.com',
+  'doubleclick.net', 'www.doubleclick.net',
+  'googletagmanager.com', 'www.googletagmanager.com',
+  'connect.facebook.net', 'www.facebook.net',
+  'facebook.net',
+  'google-analytics.com', 'www.google-analytics.com',
+  'bat.bing.com',
+  'pinterest.com', 'www.pinterest.com',
+]);
+
+/** Category C — Noise path patterns (any domain) */
+const NOISE_PATH_PATTERNS = [
+  /\/assets\//i,
+  /\/embed\//i,
+  /\/pixel\b/i,
+  /\/track\b/i,
+  /\/web-pixels@/i,
+  /\/services\/login_with_shop\//i,
+  /\/api\//i,
+  /\/_next\//i,
+  /\/static\//i,
+  /\/cdn-cgi\//i,
+  /\.js(\?|$)/i,
+  /\.css(\?|$)/i,
+  /\.png(\?|$)/i,
+  /\.gif(\?|$)/i,
+  /\.svg(\?|$)/i,
+  /\.woff2?(\?|$)/i,
+];
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -370,19 +153,27 @@ function parseProxy(proxyStr: string): { server: string; username?: string; pass
   return { server: `http://${hostPort}`, username, password };
 }
 
-function isSubdomain(domain: string): boolean {
-  const parts = domain.split(".");
-  if (parts.length <= 2) return false;
-  if (parts[0] === "www") return parts.length > 3;
-  const lastTwo = parts.slice(-2).join(".");
-  if (TWO_PART_TLDS.has(lastTwo) && parts.length <= 3) return false;
-  return true;
-}
-
 const TWO_PART_TLDS = new Set([
   'co.uk', 'com.au', 'co.jp', 'com.br', 'co.in', 'co.za', 'com.mx',
   'org.uk', 'net.au', 'co.nz', 'com.sg', 'co.kr', 'com.hk', 'co.id'
 ]);
+
+function getRootDomain(hostname: string): string {
+  const parts = hostname.split('.');
+  if (parts.length <= 2) return hostname;
+  const lastTwo = parts.slice(-2).join('.');
+  if (TWO_PART_TLDS.has(lastTwo) && parts.length >= 3) {
+    return parts.slice(-3).join('.');
+  }
+  return lastTwo;
+}
+
+function isSameOrSubdomain(host: string, baseDomain: string): boolean {
+  if (host === baseDomain) return true;
+  const hostRoot = getRootDomain(host);
+  const baseRoot = getRootDomain(baseDomain);
+  return hostRoot === baseRoot;
+}
 
 function isSameUrl(a: string, b: string): boolean {
   try {
@@ -422,15 +213,122 @@ function countDigitLetterTransitions(val: string): number {
 }
 
 // ---------------------------------------------------------------------------
+// Noise URL classification (hard filter)
+// ---------------------------------------------------------------------------
+
+interface NoiseCheck {
+  noise: boolean;
+  category: 'hijack' | 'affiliate' | 'iframe' | 'path' | null;
+  domain?: string;
+}
+
+function isNoiseUrl(url: string): NoiseCheck {
+  let hostname = '';
+  try {
+    hostname = new URL(url).hostname.toLowerCase();
+  } catch {
+    return { noise: true, category: 'path' };
+  }
+
+  // Category 0: Hijack domains (browser extension)
+  for (const hijack of HIJACK_DOMAINS) {
+    if (hostname === hijack || hostname.endsWith('.' + hijack)) {
+      return { noise: true, category: 'hijack', domain: hostname };
+    }
+  }
+
+  // Category A: Affiliate redirect middle pages
+  for (const aff of AFFILIATE_REDIRECT_DOMAINS) {
+    if (hostname === aff || hostname.endsWith('.' + aff)) {
+      return { noise: true, category: 'affiliate', domain: hostname };
+    }
+  }
+
+  // Category B: Third-party iframe / SDK / beacon
+  for (const sdk of IFRAME_SDK_DOMAINS) {
+    if (hostname === sdk || hostname.endsWith('.' + sdk)) {
+      return { noise: true, category: 'iframe', domain: hostname };
+    }
+  }
+
+  // Category C: Noise path patterns
+  try {
+    const pathname = new URL(url).pathname;
+    for (const pattern of NOISE_PATH_PATTERNS) {
+      if (pattern.test(pathname)) {
+        return { noise: true, category: 'path' };
+      }
+    }
+  } catch {}
+
+  return { noise: false, category: null };
+}
+
+// ---------------------------------------------------------------------------
+// Attribution param detection
+// ---------------------------------------------------------------------------
+
+/** Check if URL has any attribution tracking param (known or heuristic) */
+function hasAttributionParams(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    const paramEntries = Array.from(parsed.searchParams.entries());
+    if (paramEntries.length === 0) return false;
+
+    // Known tracking param
+    for (const param of ALL_KNOWN_TRACKING_PARAMS) {
+      if (parsed.searchParams.has(param)) return true;
+    }
+
+    // Heuristic: non-generic param with value >= 8 chars + mixed digits/letters
+    for (const [key, value] of paramEntries) {
+      if (GENERIC_ANALYTICS_PARAMS.has(key.toLowerCase())) continue;
+      if (value.length >= 8 && /\d/.test(value) && /[a-zA-Z]/.test(value)) {
+        return true;
+      }
+    }
+
+    // Multiple non-generic params (likely tracking combo)
+    const nonGeneric = paramEntries.filter(([k]) => !GENERIC_ANALYTICS_PARAMS.has(k.toLowerCase()));
+    if (nonGeneric.length >= 2) return true;
+
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/** Check if URL has known tracking param (for confidence boost) */
+function hasKnownTrackingParam(url: string, affiliateNetwork?: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (affiliateNetwork && AFFILIATE_TRACKING_PARAMS[affiliateNetwork]) {
+      for (const param of AFFILIATE_TRACKING_PARAMS[affiliateNetwork]) {
+        if (parsed.searchParams.has(param)) return true;
+      }
+    }
+    for (const param of ALL_KNOWN_TRACKING_PARAMS) {
+      if (parsed.searchParams.has(param)) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/** Count query params */
+function paramCount(url: string): number {
+  try {
+    return new URL(url).searchParams.size;
+  } catch {
+    return 0;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Layer 1: normalizeTrackingParams — Input-side encoding fix
 // ---------------------------------------------------------------------------
 
-/**
- * Fix tracking parameter values that have been incorrectly encoded.
- * Rule: if a param value contains %3A (encoded colon) but NOT %2F (encoded slash),
- * the colon was part of a tracking ID, not a URL -> restore it.
- * If both %3A and %2F are present, it's a legitimate encoded URL -> leave it.
- */
 function normalizeTrackingParams(url: string): string {
   try {
     const qIdx = url.indexOf('?');
@@ -468,25 +366,16 @@ function normalizeTrackingParams(url: string): string {
 // Layer 3: validateTrackingParams — Final validation before accepting
 // ---------------------------------------------------------------------------
 
-/**
- * Validate tracking parameters in a URL using a 4-level check:
- * 1. General encoding error check (%3A without %2F -> hard block)
- * 2a. Has known tracking param for the given affiliate network -> pass
- * 2b. Has known tracking param from another network -> pass + warning
- * 2c. Heuristic detection of unknown tracking params -> pass + warning
- * 2d. None of the above -> hard block (dead link)
- */
 function validateTrackingParams(url: string, affiliateNetwork?: string): ValidationResult {
   try {
     const parsed = new URL(url);
     const paramEntries = Array.from(parsed.searchParams.entries());
 
-    // No params at all -> pass with warning (tracking may be cookie-based)
     if (paramEntries.length === 0) {
       return { valid: true, isEncodingError: false, warning: 'URL无查询参数，可能缺少追踪参数' };
     }
 
-    // Check 1: General encoding error — check raw URL string for %3A without %2F
+    // Check 1: General encoding error — %3A without %2F
     const rawQuery = url.includes('?') ? url.substring(url.indexOf('?') + 1) : '';
     const rawHashIdx = rawQuery.indexOf('#');
     const rawQueryString = rawHashIdx === -1 ? rawQuery : rawQuery.substring(0, rawHashIdx);
@@ -532,7 +421,6 @@ function validateTrackingParams(url: string, affiliateNetwork?: string): Validat
     const nonGenericEntries = paramEntries.filter(([k]) => !GENERIC_ANALYTICS_PARAMS.has(k.toLowerCase()));
     const genericEntries = paramEntries.filter(([k]) => GENERIC_ANALYTICS_PARAMS.has(k.toLowerCase()));
 
-    // Non-generic param: len>=8 + contains both digits and letters -> potential Click ID
     for (const [key, value] of nonGenericEntries) {
       if (value.length >= 8 && /\d/.test(value) && /[a-zA-Z]/.test(value)) {
         return {
@@ -543,7 +431,6 @@ function validateTrackingParams(url: string, affiliateNetwork?: string): Validat
       }
     }
 
-    // Multiple non-generic params -> likely tracking param combo
     if (nonGenericEntries.length >= 2) {
       return {
         valid: true,
@@ -552,7 +439,6 @@ function validateTrackingParams(url: string, affiliateNetwork?: string): Validat
       };
     }
 
-    // Generic/UTM param: len>=16 + digit<->letter transitions>=3 -> hash value
     for (const [key, value] of genericEntries) {
       if (value.length >= 16 && countDigitLetterTransitions(value) >= 3) {
         return {
@@ -575,86 +461,57 @@ function validateTrackingParams(url: string, affiliateNetwork?: string): Validat
 }
 
 // ---------------------------------------------------------------------------
-// URL Scoring — Select best URL from redirect chain
+// Confidence & signature computation
 // ---------------------------------------------------------------------------
 
-/**
- * Score a URL based on tracking parameter completeness.
- * Higher score = more likely to be the correct landing page URL.
- */
-function scoreUrl(url: string, affiliateLink: string, affiliateNetwork?: string): number {
-  let score = 0;
+function computeConfidence(
+  url: string,
+  landingDomain: string | null,
+  hasKnownParam: boolean,
+): Confidence {
+  if (!landingDomain) return 'low';
+  let onLanding = false;
+  try {
+    const host = new URL(url).hostname;
+    onLanding = isSameOrSubdomain(host, landingDomain);
+  } catch {}
+
+  if (onLanding && hasKnownParam) return 'high';
+  if (onLanding && hasAttributionParams(url)) return 'medium';
+  if (hasKnownParam || hasAttributionParams(url)) return 'medium';
+  return 'low';
+}
+
+function computeSignature(url: string): string {
   try {
     const parsed = new URL(url);
-    const affiliateParsed = new URL(affiliateLink);
-
-    // Penalty: URL is on the same domain as the affiliate link (tracking redirect, not landing page)
-    if (parsed.hostname === affiliateParsed.hostname || parsed.hostname.endsWith('.' + affiliateParsed.hostname)) {
-      score -= 100;
-    }
-
-    // Bonus: URL has known tracking params for the given network
-    if (affiliateNetwork && AFFILIATE_TRACKING_PARAMS[affiliateNetwork]) {
-      const networkParams = AFFILIATE_TRACKING_PARAMS[affiliateNetwork];
-      for (const param of networkParams) {
-        if (parsed.searchParams.has(param)) {
-          score += 50;
-          break;
-        }
-      }
-    }
-
-    // Bonus: URL has known tracking params from any network
-    for (const param of ALL_KNOWN_TRACKING_PARAMS) {
-      if (parsed.searchParams.has(param)) {
-        score += 30;
-        break;
-      }
-    }
-
-    // Bonus: number of query parameters
-    score += parsed.searchParams.size * 5;
-
-    // Bonus: URL length (slight, more chars = more info)
-    score += Math.min(url.length / 100, 10);
+    return Array.from(parsed.searchParams.keys()).sort().join(',');
   } catch {
-    return 0;
+    return '';
   }
-  return score;
 }
 
 // ---------------------------------------------------------------------------
 // HTTP Fallback — Follow redirects without browser
 // ---------------------------------------------------------------------------
 
-/**
- * Follow HTTP redirects using Node.js fetch (no browser needed).
- * This is a fallback when Playwright times out or crashes.
- * Does NOT handle JS-based redirects.
- */
 async function nodeJsFollowRedirects(
   startUrl: string,
   maxRedirects = 10,
-  referer?: string,
 ): Promise<{ url: string | null; redirectChain: string[] }> {
   const redirectChain: string[] = [];
   let currentUrl = startUrl;
 
   for (let i = 0; i < maxRedirects; i++) {
     try {
-      // GAP-5: Forward Referer to HTTP fallback so attribution pixels that
-      // check Referer header still fire correctly when browser path fails.
-      const headers: Record<string, string> = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-      };
-      if (referer) headers['Referer'] = referer;
-
       const response = await fetch(currentUrl, {
         redirect: 'manual',
         signal: AbortSignal.timeout(15000),
-        headers,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+        },
       });
 
       if ([301, 302, 303, 307, 308].includes(response.status)) {
@@ -679,54 +536,23 @@ async function nodeJsFollowRedirects(
 // Route Bypass - intercept redirects and capture Location headers
 // ---------------------------------------------------------------------------
 
-async function setupRouteBypass(context: BrowserContext, redirectChain: string[], allRequestUrls: string[]): Promise<void> {
+async function setupRouteBypass(context: BrowserContext, redirectChain: string[]): Promise<void> {
   await context.route("**/*", async (route: Route) => {
     const request = route.request();
-    const rt = request.resourceType();
-
-    // P0-6: Resource blocking — abort image/media/font to speed up extraction 50%+
-    // Attribution is JS+cookie based, doesn't need these resources
-    if (rt === "image" || rt === "media" || rt === "font") {
-      try { await route.abort(); } catch {}
+    if (request.resourceType() !== "document") {
+      await route.continue();
       return;
     }
-
-    // Non-document requests (script, xhr, fetch, stylesheet, websocket) — pass through
-    if (rt !== "document") {
-      try { await route.continue(); } catch {}
-      return;
-    }
-
-    const url = request.url();
-    // Track all document requests for URL salvage (P0-2: URL防抖 fallback)
-    if (!allRequestUrls.includes(url)) {
-      allRequestUrls.push(url);
-    }
-
-    // P0-4: Domain-aware route.fetch — for known problematic domains, use
-    // Playwright HTTP client (HTTP/1.1) instead of browser native stack.
-    // This bypasses (1) Chromium SubresourceFilter affiliate domain block
-    // and (2) HTTP/2 + proxy incompatibility.
-    if (!isSubresourceBlockedDomain(url)) {
-      try { await route.continue(); } catch {}
-      return;
-    }
-
-    // route.fetch() path — manual redirect handling
     try {
       const response = await route.fetch({ maxRedirects: 0 });
       const status = response.status();
       if (status >= 300 && status < 400) {
-        // Capture redirect Location header into the chain
         const location = response.headers()['location'];
         if (location) {
           try {
             const redirectUrl = new URL(location, request.url()).href;
             if (!redirectChain.includes(redirectUrl)) {
               redirectChain.push(redirectUrl);
-            }
-            if (!allRequestUrls.includes(redirectUrl)) {
-              allRequestUrls.push(redirectUrl);
             }
           } catch {}
         }
@@ -749,10 +575,23 @@ async function setupRouteBypass(context: BrowserContext, redirectChain: string[]
 // Playwright Browser Helpers
 // ---------------------------------------------------------------------------
 
-// Context creation helper — used by BrowserPool-managed instances.
-// Each extraction creates a fresh BrowserContext (isolated cookies/storage)
-// but reuses the underlying Browser instance for performance.
-async function createContext(browser: Browser, referer?: string): Promise<BrowserContext> {
+async function launchBrowser(proxy?: string, referer?: string): Promise<{ browser: Browser; context: BrowserContext }> {
+  const launchOptions: Record<string, unknown> = {
+    headless: true,
+    ignoreDefaultArgs: ["--enable-automation"],
+    args: [
+      "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
+      "--disable-gpu", "--disable-blink-features=AutomationControlled",
+      "--disable-features=SubresourceFilter,SafeBrowsing",
+      "--disable-web-security", "--disable-extensions", "--no-first-run",
+      "--js-flags=--max-old-space-size=256", "--disable-soft-reload",
+      "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
+      "--disable-renderer-backgrounding", "--disable-ipc-flooding-protection",
+    ],
+  };
+  if (proxy) launchOptions.proxy = parseProxy(proxy);
+
+  const browser = await chromium.launch(launchOptions);
   const extraHeaders: Record<string, string> = { "Accept-Language": "en-US,en;q=0.9" };
   if (referer) extraHeaders["Referer"] = referer;
 
@@ -765,614 +604,488 @@ async function createContext(browser: Browser, referer?: string): Promise<Browse
     bypassCSP: true,
     extraHTTPHeaders: extraHeaders,
   });
-  return context;
+  return { browser, context };
 }
 
-async function closeContext(context: BrowserContext): Promise<void> {
-  try { await context.close(); } catch (err) { console.error("Error closing context:", err); }
+async function closeBrowser(browser: Browser): Promise<void> {
+  try { await browser.close(); } catch (err) { console.error("Error closing browser:", err); }
+  try { if (typeof globalThis.gc === 'function') globalThis.gc(); } catch {}
 }
 
 // ---------------------------------------------------------------------------
-// P0-2: URL防抖 (waitForRedirectSettle)
+// stabilizeAddressBarUrl — full-scan __urlChanges + poll page.url()
 // ---------------------------------------------------------------------------
 
 /**
- * Wait for the page URL to stabilize (stop changing) for stableTime ms.
- * Returns the settled URL if it differs from fromUrl, or null if URL kept
- * changing or never settled within maxWait.
- *
- * This addresses the "抓到中间页" problem: affiliate redirect chains are
- * multi-hop (联盟→归因回传→第一方cookie→落地页) and URL changes rapidly.
- * Without settling, we'd sample the URL mid-redirect and capture an
- * intermediate page (e.g. adservice.google.com instead of real landing).
+ * Stabilize the address bar URL after a navigation phase.
+ * Step 1: Read window.__urlChanges (full scan), filter noise, pick the URL with
+ *         the most params (NOT the last one — replaceState can overwrite pushState params).
+ * Step 2: Poll page.url() every 500ms; if it changes to a non-noise URL, adopt it;
+ *         if same host but more params, adopt the richer version.
  */
-async function waitForRedirectSettle(
+async function stabilizeAddressBarUrl(
   page: Page,
-  fromUrl: string,
-  options: { maxWait?: number; stableTime?: number } = {}
-): Promise<string | null> {
-  const maxWait = options.maxWait ?? 8000;
-  const stableTime = options.stableTime ?? 2500;
-  const deadline = Date.now() + maxWait;
-  let lastUrl = page.url();
-  let lastChangeAt = Date.now();
+  currentUrl: string,
+  maxWaitMs: number,
+): Promise<string> {
+  let best = currentUrl;
 
-  while (Date.now() < deadline) {
-    await new Promise(resolve => setTimeout(resolve, 250));
-    let current: string;
-    try { current = page.url(); } catch { continue; }
+  // Step 1: Full scan __urlChanges
+  try {
+    const changes = await page.evaluate(() => {
+      return (window as any).__urlChanges as string[] | undefined;
+    });
+    if (Array.isArray(changes)) {
+      const normalized = changes
+        .map(u => normalizeTrackingParams(u))
+        .filter(u => !isChromeError(u));
+      // Prefer non-noise URLs with most params
+      let bestChange: string | null = null;
+      let bestParams = -1;
+      for (const u of normalized) {
+        const noise = isNoiseUrl(u);
+        if (noise.noise && noise.category !== 'affiliate') continue; // allow affiliate (may carry params)
+        const pc = paramCount(u);
+        if (pc > bestParams) {
+          bestParams = pc;
+          bestChange = u;
+        }
+      }
+      if (bestChange && paramCount(bestChange) > paramCount(best)) {
+        best = bestChange;
+      }
+    }
+  } catch {}
 
-    if (!isSameUrl(current, lastUrl)) {
-      // URL changed — reset the stability timer
-      lastUrl = current;
-      lastChangeAt = Date.now();
+  // Step 2: Poll page.url() for stability
+  const startTime = Date.now();
+  let lastUrl = best;
+  let stableCount = 0;
+  while (Date.now() - startTime < maxWaitMs) {
+    await new Promise(r => setTimeout(r, 500));
+    let pageUrl: string;
+    try {
+      pageUrl = page.url();
+    } catch {
+      break;
+    }
+    if (isChromeError(pageUrl)) {
       continue;
     }
-    // URL has been stable for stableTime → check if it's a valid landing
-    if (Date.now() - lastChangeAt >= stableTime) {
-      if (isSameUrl(lastUrl, fromUrl) || isChromeError(lastUrl)) {
-        return null; // Still on affiliate link or chrome error page
+    const normalized = normalizeTrackingParams(pageUrl);
+    if (!isSameUrl(normalized, lastUrl)) {
+      // URL changed — check if it's noise
+      const noise = isNoiseUrl(normalized);
+      if (!noise.noise || noise.category === 'affiliate') {
+        lastUrl = normalized;
+        stableCount = 0;
       }
+    } else {
+      // Same URL — but maybe params got richer (same host)
+      if (paramCount(normalized) > paramCount(lastUrl)) {
+        try {
+          const host1 = new URL(normalized).hostname;
+          const host2 = new URL(lastUrl).hostname;
+          if (host1 === host2) {
+            lastUrl = normalized;
+          }
+        } catch {}
+      }
+      stableCount++;
+      if (stableCount >= 2) break; // stable for 1s
+    }
+  }
+
+  // Pick the richer of (lastUrl, best) if same host
+  if (paramCount(lastUrl) > paramCount(best)) {
+    best = lastUrl;
+  } else if (paramCount(best) === 0 && paramCount(lastUrl) > 0) {
+    best = lastUrl;
+  }
+
+  return best;
+}
+
+// ---------------------------------------------------------------------------
+// waitForRedirectSettle — wait for URL to stabilize after initial nav
+// ---------------------------------------------------------------------------
+
+async function waitForRedirectSettle(
+  page: Page,
+  initialUrl: string,
+  stableMs: number,
+  maxWaitMs: number,
+): Promise<string> {
+  const startTime = Date.now();
+  let lastUrl = initialUrl;
+  let stableSince = Date.now();
+
+  while (Date.now() - startTime < maxWaitMs) {
+    await new Promise(r => setTimeout(r, 500));
+    let pageUrl: string;
+    try {
+      pageUrl = page.url();
+    } catch {
+      continue;
+    }
+    if (isChromeError(pageUrl)) continue;
+    const normalized = normalizeTrackingParams(pageUrl);
+    if (!isSameUrl(normalized, lastUrl)) {
+      lastUrl = normalized;
+      stableSince = Date.now();
+    } else if (Date.now() - stableSince >= stableMs) {
       return lastUrl;
     }
   }
-  return null; // Never settled within maxWait
+  return lastUrl;
 }
 
 // ---------------------------------------------------------------------------
-// P0-3: AbortController true cancellation
-// ---------------------------------------------------------------------------
-
-interface CancellationHandle {
-  signal: AbortSignal;
-  cleanup: () => void;
-}
-
-function createExtractorTimeout(timeoutMs: number = EXTRACTOR_TIMEOUT_MS): CancellationHandle {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  const onAbort = () => {
-    // Force cleanup will be done by the caller via try/finally
-    console.warn(`[Extractor] Aborted after ${timeoutMs}ms timeout`);
-  };
-  controller.signal.addEventListener('abort', onAbort);
-
-  return {
-    signal: controller.signal,
-    cleanup: () => {
-      clearTimeout(timer);
-      controller.signal.removeEventListener('abort', onAbort);
-    },
-  };
-}
-
-function throwIfAborted(signal?: AbortSignal): void {
-  if (signal?.aborted) {
-    throw new DOMException('Operation aborted', 'AbortError');
-  }
-}
-
-// ---------------------------------------------------------------------------
-// GAP-1: Multi-signal salvage candidate scoring
-// Replaces the old "take last valid candidate" heuristic that selected
-// iframe/beacon URLs and rewarded mid-redirect hops by host frequency.
-// ---------------------------------------------------------------------------
-
-/**
- * Derive the most likely landing domain from the redirect chain.
- * Heuristic: the last non-affiliate-network, non-beacon, non-iframe domain
- * in the chain is most likely the real landing domain.
- * Returns '' if no hint can be derived.
- */
-function deriveLandingDomainHint(redirectChain: string[]): string {
-  for (let i = redirectChain.length - 1; i >= 0; i--) {
-    try {
-      const host = new URL(redirectChain[i]).hostname.toLowerCase();
-      if (!host) continue;
-      if (isAffiliateNetworkDomain(host)) continue;
-      if (isTrackingBeaconDomain(host)) continue;
-      if (isThirdPartyIframeDomain(host)) continue;
-      // Strip subdomain to get registrable domain (rough heuristic)
-      const parts = host.split('.');
-      if (parts.length >= 2) {
-        return parts.slice(-2).join('.');
-      }
-      return host;
-    } catch {}
-  }
-  return '';
-}
-
-/**
- * Score a salvage candidate URL using 6 signals.
- * Threshold: score >= 40 to be accepted as salvage result.
- *
- * Signal 0 (bonus): Landing domain match — +60
- *   hostname's registrable domain === landingDomainHint
- * Signal 1: Injected tracking param — +50
- *   URL contains any ALL_KNOWN_TRACKING_PARAMS
- * Signal 2: Tracking ID shape — +20
- *   Some param value len>=10 and contains both letters and digits
- * Signal 3: Hostname frequency — +5 per occurrence (cap 25)
- *   How many times this hostname appears in allCandidates
- * Signal 4: Non-noise domain — +30
- *   Not in TRACKING_BEACON ∪ THIRD_PARTY_IFRAME, path doesn't match NOISE_PATH
- * Signal 5: Landing page path shape — +20
- *   pathname matches /, /en(-us)?, /collections/, /products/, /p/, /item/, /dp/
- * Signal 6: Affiliate network domain — +25
- *   hostname in AFFILIATE_NETWORK_DOMAINS
- */
-function scoreSalvageCandidate(
-  url: string,
-  allCandidates: string[],
-  landingDomainHint: string,
-): number {
-  let score = 0;
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    return 0;
-  }
-  const hostname = parsed.hostname.toLowerCase();
-  const pathname = parsed.pathname.toLowerCase();
-
-  // Signal 0: Landing domain bonus
-  if (landingDomainHint) {
-    const parts = hostname.split('.');
-    const registrable = parts.length >= 2 ? parts.slice(-2).join('.') : hostname;
-    if (registrable === landingDomainHint) {
-      score += 60;
-    }
-  }
-
-  // Signal 1: Injected tracking param
-  let hasKnownParam = false;
-  for (const param of ALL_KNOWN_TRACKING_PARAMS) {
-    if (parsed.searchParams.has(param)) {
-      hasKnownParam = true;
-      break;
-    }
-  }
-  if (hasKnownParam) score += 50;
-
-  // Signal 2: Tracking ID shape (len>=10, has letters + digits)
-  let hasTrackingIdShape = false;
-  for (const [, value] of parsed.searchParams.entries()) {
-    if (value.length >= 10 && /\d/.test(value) && /[a-zA-Z]/.test(value)) {
-      hasTrackingIdShape = true;
-      break;
-    }
-  }
-  if (hasTrackingIdShape) score += 20;
-
-  // Signal 3: Hostname frequency (cap 25)
-  let hostCount = 0;
-  for (const candidate of allCandidates) {
-    try {
-      if (new URL(candidate).hostname.toLowerCase() === hostname) {
-        hostCount++;
-      }
-    } catch {}
-  }
-  score += Math.min(hostCount * 5, 25);
-
-  // Signal 4: Non-noise domain
-  const isBeacon = isTrackingBeaconDomain(hostname);
-  const isIframe = isThirdPartyIframeDomain(hostname);
-  const isNoisePath = matchesNoisePath(pathname);
-  if (!isBeacon && !isIframe && !isNoisePath) {
-    score += 30;
-  }
-
-  // Signal 5: Landing page path shape
-  const landingPathPatterns = [
-    /^\/$/, /^\/en(-us)?$/i, /^\/collections\//i, /^\/products\//i,
-    /^\/p\//i, /^\/item\//i, /^\/dp\//i, /^\/[a-z]{2}(-[a-z]{2})?$/i,
-  ];
-  if (landingPathPatterns.some(re => re.test(pathname))) {
-    score += 20;
-  }
-
-  // Signal 6: Affiliate network domain
-  if (isAffiliateNetworkDomain(hostname)) {
-    score += 25;
-  }
-
-  return score;
-}
-
-// ---------------------------------------------------------------------------
-// GAP-2: Hijack detection (coupon browser extensions etc.)
-// ---------------------------------------------------------------------------
-
-const HIJACK_DOMAINS = ['fatcoupon.com', 'couponfollow.com', 'honey.is', 'honey.io'];
-
-/**
- * Detect hijack by coupon-style browser extensions.
- * These extensions intercept redirect chains and inject their own affiliate
- * links. Must scan redirectChain + allRequestUrls + finalUrl because the
- * hijack may appear at any point, not just the terminal URL.
- *
- * Returns the hijack domain if detected, null otherwise.
- */
-function detectHijack(
-  redirectChain: string[],
-  allRequestUrls: string[],
-  finalUrl: string,
-): string | null {
-  const allUrls = [...redirectChain, ...allRequestUrls];
-  if (finalUrl) allUrls.push(finalUrl);
-  for (const url of allUrls) {
-    try {
-      const host = new URL(url).hostname.toLowerCase();
-      for (const hijack of HIJACK_DOMAINS) {
-        if (host === hijack || host.endsWith('.' + hijack)) {
-          return hijack;
-        }
-      }
-    } catch {}
-  }
-  return null;
-}
-
-// ---------------------------------------------------------------------------
-// GAP-3: Phase 4 JS redirect noise guard
-// ---------------------------------------------------------------------------
-
-/**
- * Guard for Phase 4 JS redirect / meta refresh / iframe URLs.
- * Rejects:
- *   - Same-origin URLs (relative redirects that loop back to affiliate site)
- *   - Noise paths (privacy-policy, login, checkout, etc.)
- *   - Impact policy/legal/privacy pages
- * Returns true if the URL should be REJECTED (is noise).
- */
-function isNoiseJsRedirect(rawUrl: string, pageOrigin: string): boolean {
-  let parsed: URL;
-  try {
-    parsed = new URL(rawUrl, pageOrigin);
-  } catch {
-    return true; // Unparseable → reject
-  }
-  // Reject same-origin (loops back to affiliate site, not a real landing)
-  if (pageOrigin && parsed.origin === pageOrigin) return true;
-  const path = parsed.pathname.toLowerCase();
-  if (matchesNoisePath(path)) return true;
-  // Reject Impact policy/legal pages
-  if (/(^|\.)impact\.com$/.test(parsed.hostname) && /policy|privacy|legal/.test(path)) {
-    return true;
-  }
-  return false;
-}
-
-// ---------------------------------------------------------------------------
-// Build best result from redirect chain using scoring
+// Build best result — domain-anchored selection + 5% fallback
 // ---------------------------------------------------------------------------
 
 function buildBestResult(
   currentUrl: string,
   redirectChain: string[],
   affiliateLink: string,
-  affiliateNetwork?: string,
+  affiliateNetwork: string | undefined,
+  pageChanges: string[],
   usedFallback = false,
 ): ExtractResult {
-  // Layer 1: Normalize all redirect chain URLs
+  // Layer 1: Normalize all URLs
   const normalizedChain = redirectChain.map(u => normalizeTrackingParams(u));
   const normalizedCurrent = normalizeTrackingParams(currentUrl);
+  const normalizedChanges = pageChanges.map(u => normalizeTrackingParams(u));
 
-  // Build candidate URLs (deduplicated, excluding affiliate link, chrome errors,
-  // and GAP-4: exclude tracking beacon + third-party iframe domains which are
-  // never real landing pages. Affiliate network domains are KEPT as candidates
-  // because attribution may have completed and the URL is still on a network
-  // domain — scoreUrl will rank them appropriately.)
-  const candidateUrls = new Map<string, number>();
-  for (const url of normalizedChain) {
-    if (!isSameUrl(url, affiliateLink) && !isChromeError(url) && !candidateUrls.has(url)) {
+  // Collect observed URLs (deduplicated, order-preserved)
+  const observed: string[] = [];
+  const seen = new Set<string>();
+  const pushObserved = (u: string) => {
+    if (!u || seen.has(u)) return;
+    seen.add(u);
+    observed.push(u);
+  };
+  for (const u of normalizedChain) pushObserved(u);
+  if (!isSameUrl(normalizedCurrent, affiliateLink) && !isChromeError(normalizedCurrent)) {
+    pushObserved(normalizedCurrent);
+  }
+  for (const u of normalizedChanges) {
+    if (!isChromeError(u)) pushObserved(u);
+  }
+
+  // Classify each URL
+  let hijackedDomain: string | null = null;
+  for (const u of observed) {
+    const noise = isNoiseUrl(u);
+    if (noise.category === 'hijack') {
+      hijackedDomain = noise.domain || hijackedDomain;
+    }
+  }
+  if (hijackedDomain) {
+    return {
+      success: false,
+      landingPageUrl: null,
+      redirectChain: normalizedChain,
+      finalUrl: normalizedCurrent,
+      usedFallback,
+      failureType: 'hijacked',
+      hijackedDomain: hijackedDomain,
+    };
+  }
+
+  // Build clean candidates (exclude affiliate link itself, chrome errors, noise)
+  let affiliateHost = '';
+  try { affiliateHost = new URL(affiliateLink).hostname; } catch {}
+
+  const cleanCandidates = observed.filter(u => {
+    if (isSameUrl(u, affiliateLink)) return false;
+    if (isChromeError(u)) return false;
+    const noise = isNoiseUrl(u);
+    if (noise.noise) return false;
+    // Exclude URLs on the same domain as affiliate link (still on tracking domain)
+    if (affiliateHost) {
       try {
-        const host = new URL(url).hostname.toLowerCase();
-        if (isTrackingBeaconDomain(host) || isThirdPartyIframeDomain(host)) continue;
-      } catch { continue; }
-      candidateUrls.set(url, scoreUrl(url, affiliateLink, affiliateNetwork));
+        const uHost = new URL(u).hostname;
+        if (isSameOrSubdomain(uHost, affiliateHost)) return false;
+      } catch {}
+    }
+    return true;
+  });
+
+  if (cleanCandidates.length === 0) {
+    return {
+      success: false,
+      landingPageUrl: null,
+      redirectChain: normalizedChain,
+      finalUrl: normalizedCurrent,
+      usedFallback,
+      failureType: 'incompleteExtraction',
+    };
+  }
+
+  // Infer landing domain = hostname of the LAST clean candidate
+  let landingDomain: string | null = null;
+  try {
+    landingDomain = new URL(cleanCandidates[cleanCandidates.length - 1]).hostname;
+  } catch {}
+
+  // Main selection (95%): on landing domain + has attribution params
+  const onLandingWithParams = cleanCandidates
+    .filter(u => {
+      if (!landingDomain) return false;
+      try {
+        const host = new URL(u).hostname;
+        if (!isSameOrSubdomain(host, landingDomain)) return false;
+      } catch { return false; }
+      return hasAttributionParams(u);
+    })
+    .sort((a, b) => {
+      // Most params first, then later chain position
+      const pcDiff = paramCount(b) - paramCount(a);
+      if (pcDiff !== 0) return pcDiff;
+      return observed.indexOf(b) - observed.indexOf(a);
+    });
+
+  let winner: string | null = onLandingWithParams[0] || null;
+
+  // Fallback (5%): landing page lost params, backtrace to find last URL with attribution
+  if (!winner) {
+    const backtraceCandidates = observed.filter(u => {
+      if (isSameUrl(u, affiliateLink)) return false;
+      if (isChromeError(u)) return false;
+      const noise = isNoiseUrl(u);
+      // Exclude only iframe/path noise, allow affiliate middle pages (they may carry params)
+      if (noise.noise && (noise.category === 'iframe' || noise.category === 'path')) return false;
+      return hasAttributionParams(u);
+    });
+    if (backtraceCandidates.length > 0) {
+      // Pick the LAST one in chain (closest to landing)
+      winner = backtraceCandidates[backtraceCandidates.length - 1];
     }
   }
-  if (!isSameUrl(normalizedCurrent, affiliateLink) && !isChromeError(normalizedCurrent) && !candidateUrls.has(normalizedCurrent)) {
-    try {
-      const host = new URL(normalizedCurrent).hostname.toLowerCase();
-      if (!isTrackingBeaconDomain(host) && !isThirdPartyIframeDomain(host)) {
-        candidateUrls.set(normalizedCurrent, scoreUrl(normalizedCurrent, affiliateLink, affiliateNetwork));
-      }
-    } catch {}
+
+  if (!winner) {
+    // Reached landing domain but no attribution params anywhere
+    return {
+      success: false,
+      landingPageUrl: null,
+      redirectChain: normalizedChain,
+      finalUrl: normalizedCurrent,
+      usedFallback,
+      failureType: 'noAttributionParams',
+    };
   }
 
-  // Pick the best URL (highest score), fallback to currentUrl if no candidates
-  let bestUrl = normalizedCurrent;
-  let bestScore = candidateUrls.get(normalizedCurrent) ?? -Infinity;
-
-  for (const [url, score] of candidateUrls) {
-    if (score > bestScore) {
-      bestScore = score;
-      bestUrl = url;
-    }
-  }
-
-  // Layer 2: Re-apply normalization (in case new URL() re-encoded colons internally)
-  bestUrl = normalizeTrackingParams(bestUrl);
-
-  // Layer 3: Validate tracking params
-  const validation = validateTrackingParams(bestUrl, affiliateNetwork);
+  // Winner found — validate & compute confidence
+  const validation = validateTrackingParams(winner, affiliateNetwork);
+  const knownParam = hasKnownTrackingParam(winner, affiliateNetwork);
+  const confidence = computeConfidence(winner, landingDomain, knownParam);
+  const signature = computeSignature(winner);
 
   return {
     success: true,
-    landingPageUrl: bestUrl,
+    landingPageUrl: winner,
     redirectChain: normalizedChain,
-    finalUrl: bestUrl,
+    finalUrl: winner,
     validation,
     usedFallback,
+    confidence,
+    signature,
   };
 }
 
 // ---------------------------------------------------------------------------
-// 5-Phase Extraction Strategy (improved with BrowserPool + URL防抖 + AbortController)
+// Extraction Strategy (6 phases + fallback)
 // ---------------------------------------------------------------------------
 
 async function extractOnce(
   affiliateLink: string,
   proxyUrl?: string,
   affiliateNetwork?: string,
-  presetReferer?: string,
+  customReferer?: string,
 ): Promise<ExtractResult> {
-  // Referer priority: explicit preset > derived from affiliate link origin
-  const referer = presetReferer && presetReferer.trim() ? presetReferer.trim() : deriveReferer(affiliateLink);
+  const referer = customReferer || deriveReferer(affiliateLink);
+  const { browser, context } = await launchBrowser(proxyUrl, referer);
 
-  // P0-3: AbortController — true cancellation on timeout (90s default)
-  const cancelHandle = createExtractorTimeout();
-  const { signal } = cancelHandle;
-
-  // P0-2: Track ALL document request URLs for URL salvage fallback
   const redirectChain: string[] = [];
-  const allRequestUrls: string[] = [];
+  await setupRouteBypass(context, redirectChain);
 
-  // P0-1: Acquire browser from pool (reuses instance per proxy)
-  const instance = await browserPool.acquire(proxyUrl || '');
-  let context: BrowserContext | null = null;
-  let page: Page | null = null;
+  // Init script: anti-headless + pushState/replaceState hook
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => false });
+    (window as any).chrome = { runtime: {}, app: {} };
 
-  try {
-    throwIfAborted(signal);
-    context = await createContext(instance.browser, referer);
-    await setupRouteBypass(context, redirectChain, allRequestUrls);
-
-    // Stealth plugin handles navigator.webdriver + window.chrome + 30+ other
-    // fingerprint vectors, so we don't need manual addInitScript anymore.
-    // (Keeping the import for fallback if stealth plugin fails to load.)
-
-    throwIfAborted(signal);
-    page = await context.newPage();
-    let previousUrl = affiliateLink;
-
-    // Track URL changes via response events (supplementary to route bypass)
-    page.on("response", (response) => {
-      const url = response.url();
-      const request = response.request();
-      if (request.resourceType() !== "document") return;
-      if (request.frame() !== page!.mainFrame()) return;
-      if (!isSameUrl(url, previousUrl) && !redirectChain.includes(url)) {
-        redirectChain.push(url);
-        if (!allRequestUrls.includes(url)) allRequestUrls.push(url);
-        previousUrl = url;
-      }
-    });
-
-    // ── Phase 1: Navigate to affiliate link (waitUntil: load, 60s) ──
-    // Must use "load" (not "domcontentloaded") because affiliate attribution
-    // JS (Impact first-party cookie, Google adservice beacon) runs AFTER
-    // domcontentloaded. Using domcontentloaded samples mid-redirect and
-    // captures intermediate pages (e.g. adservice.google.com).
-    throwIfAborted(signal);
+    // Hook pushState/replaceState to capture JS-modified address bar URLs
+    (window as any).__urlChanges = [];
     try {
-      await page.goto(affiliateLink, { waitUntil: "load", timeout: 60000 });
-    } catch (navError) {
-      const navMsg = navError instanceof Error ? navError.message : String(navError);
-      console.warn("Phase 1 navigation warning:", navMsg);
-      // P0-4: Detect HTTP/2 protocol errors → add domain to runtime blocked list
-      if (navMsg.includes('ERR_HTTP2_PROTOCOL_ERROR')) {
-        addRuntimeBlockedDomain(affiliateLink);
+      const origPush = history.pushState.bind(history);
+      const origReplace = history.replaceState.bind(history);
+      const record = (kind: string, urlArg: any) => {
+        try {
+          if (!urlArg) return;
+          let abs: string;
+          if (typeof urlArg === 'string') {
+            abs = new URL(urlArg, location.href).href;
+          } else {
+            abs = location.href;
+          }
+          (window as any).__urlChanges.push(abs);
+        } catch {}
+      };
+      history.pushState = function (...args: any[]) {
+        record('push', args[2]);
+        return origPush(...(args as [any, string, string?]));
+      };
+      history.replaceState = function (...args: any[]) {
+        record('replace', args[2]);
+        return origReplace(...(args as [any, string, string?]));
+      };
+    } catch {}
+  });
+
+  const page = await context.newPage();
+  let previousUrl = affiliateLink;
+
+  // Track URL changes via response events (supplementary)
+  page.on("response", (response) => {
+    const url = response.url();
+    const request = response.request();
+    if (request.resourceType() !== "document") return;
+    if (request.frame() !== page.mainFrame()) return;
+    const normalized = normalizeTrackingParams(url);
+    if (!isSameUrl(normalized, previousUrl) && !redirectChain.includes(normalized)) {
+      redirectChain.push(normalized);
+      previousUrl = normalized;
+    }
+  });
+
+  let currentUrl: string;
+
+  // Phase 1: Initial navigation
+  try {
+    await page.goto(affiliateLink, { waitUntil: "load", timeout: 30000 });
+  } catch (navError) {
+    console.warn("Phase 1 navigation warning:", navError instanceof Error ? navError.message : String(navError));
+  }
+
+  currentUrl = normalizeTrackingParams(page.url());
+
+  // Quick win: if URL already changed away from affiliate link
+  if (!isSameUrl(currentUrl, affiliateLink) && !isChromeError(currentUrl)) {
+    currentUrl = await stabilizeAddressBarUrl(page, currentUrl, 2500);
+    const changes = await collectUrlChanges(page);
+    await closeBrowser(browser);
+    return buildBestResult(currentUrl, redirectChain, affiliateLink, affiliateNetwork, changes, false);
+  }
+
+  // Phase 1.5: waitForRedirectSettle (URL stable 2s, max 8s)
+  if (isSameUrl(currentUrl, affiliateLink) || isChromeError(currentUrl)) {
+    const settled = await waitForRedirectSettle(page, currentUrl, 2000, 8000);
+    if (!isSameUrl(settled, affiliateLink) && !isChromeError(settled)) {
+      currentUrl = settled;
+    }
+  }
+
+  // Phase 2: waitForURL
+  if (isSameUrl(currentUrl, affiliateLink) || isChromeError(currentUrl)) {
+    try {
+      await page.waitForURL(
+        (url) => !isSameUrl(url.toString(), affiliateLink) && !isChromeError(url.toString()),
+        { timeout: 10000 },
+      );
+      currentUrl = normalizeTrackingParams(page.url());
+    } catch {}
+  }
+
+  // Phase 3: networkidle
+  try { await page.waitForLoadState("networkidle", { timeout: 8000 }); } catch {}
+  currentUrl = normalizeTrackingParams(page.url());
+  if (!isSameUrl(currentUrl, affiliateLink) && !isChromeError(currentUrl)) {
+    currentUrl = await stabilizeAddressBarUrl(page, currentUrl, 2500);
+  }
+
+  // Phase 4: Parse page content for redirect URLs (meta refresh / JS redirect / iframe)
+  if (isSameUrl(currentUrl, affiliateLink) || isChromeError(currentUrl)) {
+    const metaRefreshUrl = await page.evaluate(() => {
+      const meta = document.querySelector('meta[http-equiv="refresh"]');
+      if (meta) {
+        const match = (meta.getAttribute("content") || "").match(/url=(.+)/i);
+        return match ? match[1].trim() : null;
       }
-      // P0-4: Detect tunnel connection failures (proxy IP blocked)
-      if (navMsg.includes('ERR_TUNNEL_CONNECTION_FAILED')) {
-        throw new Error(`ERR_TUNNEL_CONNECTION_FAILED: 代理IP无法建立到目标域名的HTTPS隧道，可能IP段被封: ${navMsg}`);
-      }
+      return null;
+    });
+    if (metaRefreshUrl) {
+      try { await page.goto(metaRefreshUrl, { waitUntil: "load", timeout: 30000 }); } catch {}
+      currentUrl = normalizeTrackingParams(page.url());
     }
 
-    throwIfAborted(signal);
-    let currentUrl = page.url();
-
-    // ── Phase 1.5: URL防抖 (P0-2) — wait for URL to stabilize 2.5s ──
-    // This is the KEY fix for "抓到中间页" problem. Affiliate redirect chains
-    // are multi-hop and URL changes rapidly. Without settling, we'd capture
-    // intermediate pages.
     if (isSameUrl(currentUrl, affiliateLink) || isChromeError(currentUrl)) {
-      console.log("[Extract] Phase 1.5: Waiting for URL to settle...");
-      const settledUrl = await waitForRedirectSettle(page, affiliateLink, { maxWait: 8000, stableTime: 2500 });
-      if (settledUrl) {
-        console.log("[Extract] Phase 1.5: URL settled →", settledUrl);
-        currentUrl = settledUrl;
-      }
-    }
-
-    // Early exit if Phase 1.5 found a landing page
-    if (!isSameUrl(currentUrl, affiliateLink) && !isChromeError(currentUrl)) {
-      // GAP-2: Hijack detection before accepting
-      const hijackDomain = detectHijack(redirectChain, allRequestUrls, currentUrl);
-      if (hijackDomain) {
-        console.warn(`[Extract] Hijack detected (Phase 1.5): ${hijackDomain}`);
-        return {
-          success: false,
-          landingPageUrl: null,
-          redirectChain: redirectChain.map(u => normalizeTrackingParams(u)),
-          finalUrl: currentUrl,
-          usedFallback: false,
-          hijacked: true,
-          hijackDomain,
-        };
-      }
-      return buildBestResult(currentUrl, redirectChain, affiliateLink, affiliateNetwork, false);
-    }
-
-    throwIfAborted(signal);
-
-    // ── Phase 2: waitForURL fallback (20s) ──
-    if (isSameUrl(currentUrl, affiliateLink) || isChromeError(currentUrl)) {
-      try {
-        await page.waitForURL(
-          (url) => !isSameUrl(url.toString(), affiliateLink) && !isChromeError(url.toString()),
-          { timeout: 20000 }
-        );
-        currentUrl = page.url();
-      } catch {}
-    }
-
-    throwIfAborted(signal);
-
-    // ── Phase 3: networkidle (15s) ──
-    try { await page.waitForLoadState("networkidle", { timeout: 15000 }); } catch {}
-    currentUrl = page.url();
-
-    throwIfAborted(signal);
-
-    // ── Phase 4: Parse page content for redirect URLs ──
-    // GAP-3: All three branches (meta refresh / JS redirect / iframe) are
-    // guarded by isNoiseJsRedirect to reject same-origin loops, noise paths
-    // (privacy-policy, login, checkout), and Impact policy pages. Without
-    // this guard, Phase 4 would navigate to /privacy-policy etc. and capture
-    // those as the landing page.
-    if (isSameUrl(currentUrl, affiliateLink) || isChromeError(currentUrl)) {
-      let pageOrigin = '';
-      try { pageOrigin = new URL(affiliateLink).origin; } catch {}
-
-      const metaRefreshUrl = await page.evaluate(() => {
-        const meta = document.querySelector('meta[http-equiv="refresh"]');
-        if (meta) { const match = (meta.getAttribute("content") || "").match(/url=(.+)/i); return match ? match[1].trim() : null; }
+      const jsRedirectUrl = await page.evaluate(() => {
+        for (const script of document.querySelectorAll("script")) {
+          const text = script.textContent || "";
+          const match = text.match(/(?:window\.)?location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/);
+          if (match) return match[1];
+          const match2 = text.match(/location\.replace\(['"]([^'"]+)['"]\)/);
+          if (match2) return match2[1];
+        }
         return null;
       });
-      if (metaRefreshUrl && pageOrigin && !isNoiseJsRedirect(metaRefreshUrl, pageOrigin)) {
-        throwIfAborted(signal);
-        try { await page.goto(metaRefreshUrl, { waitUntil: "load", timeout: 60000 }); currentUrl = page.url(); } catch {}
-      }
-
-      if (isSameUrl(currentUrl, affiliateLink) || isChromeError(currentUrl)) {
-        const jsRedirectUrl = await page.evaluate(() => {
-          for (const script of document.querySelectorAll("script")) {
-            const text = script.textContent || "";
-            const match = text.match(/(?:window\.)?location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/);
-            if (match) return match[1];
-            const match2 = text.match(/location\.replace\(['"]([^'"]+)['"]\)/);
-            if (match2) return match2[1];
-          }
-          return null;
-        });
-        if (jsRedirectUrl && pageOrigin && !isNoiseJsRedirect(jsRedirectUrl, pageOrigin)) {
-          throwIfAborted(signal);
-          try { await page.goto(jsRedirectUrl, { waitUntil: "load", timeout: 60000 }); currentUrl = page.url(); } catch {}
-        }
-      }
-
-      if (isSameUrl(currentUrl, affiliateLink) || isChromeError(currentUrl)) {
-        const iframeUrl = await page.evaluate(() => { const iframe = document.querySelector("iframe[src]"); return iframe ? iframe.getAttribute("src") : null; });
-        if (iframeUrl && iframeUrl.startsWith("http") && pageOrigin && !isNoiseJsRedirect(iframeUrl, pageOrigin)) {
-          throwIfAborted(signal);
-          try { await page.goto(iframeUrl, { waitUntil: "load", timeout: 60000 }); currentUrl = page.url(); } catch {}
-        }
+      if (jsRedirectUrl) {
+        try { await page.goto(jsRedirectUrl, { waitUntil: "load", timeout: 30000 }); } catch {}
+        currentUrl = normalizeTrackingParams(page.url());
       }
     }
 
-    throwIfAborted(signal);
-
-    // ── Phase 5: Retry with networkidle (45s) ──
     if (isSameUrl(currentUrl, affiliateLink) || isChromeError(currentUrl)) {
-      try { await page.goto(affiliateLink, { waitUntil: "networkidle", timeout: 45000 }); currentUrl = page.url(); } catch {}
-    }
-
-    // If Playwright found a landing page, score and validate
-    if (!isSameUrl(currentUrl, affiliateLink) && !isChromeError(currentUrl)) {
-      // GAP-2: Hijack detection before accepting
-      const hijackDomain = detectHijack(redirectChain, allRequestUrls, currentUrl);
-      if (hijackDomain) {
-        console.warn(`[Extract] Hijack detected (Phase 2-5): ${hijackDomain}`);
-        return {
-          success: false,
-          landingPageUrl: null,
-          redirectChain: redirectChain.map(u => normalizeTrackingParams(u)),
-          finalUrl: currentUrl,
-          usedFallback: false,
-          hijacked: true,
-          hijackDomain,
-        };
-      }
-      return buildBestResult(currentUrl, redirectChain, affiliateLink, affiliateNetwork, false);
-    }
-
-    // ── URL Salvage (P0-2 fallback, GAP-1 multi-signal scoring) ──
-    // 5 phases all failed but page.url() still on affiliate link. Don't give up —
-    // salvage from allRequestUrls using 6-signal scoring (was: take last valid
-    // candidate, which selected iframe/beacon URLs). Attribution is preserved
-    // (browser visited the URL, cookies written).
-    if (allRequestUrls.length > 0) {
-      console.log(`[Extract] URL salvage: scoring ${allRequestUrls.length} captured request URLs`);
-      // Filter candidates: exclude affiliate link itself, chrome errors, beacons, iframes
-      const validCandidates = allRequestUrls.filter(u => {
-        if (isSameUrl(u, affiliateLink)) return false;
-        if (isChromeError(u)) return false;
-        try {
-          const host = new URL(u).hostname.toLowerCase();
-          if (isTrackingBeaconDomain(host)) return false;
-          if (isThirdPartyIframeDomain(host)) return false;
-          return true;
-        } catch {
-          return false;
-        }
+      const iframeUrl = await page.evaluate(() => {
+        const iframe = document.querySelector("iframe[src]");
+        return iframe ? iframe.getAttribute("src") : null;
       });
-      if (validCandidates.length > 0) {
-        const landingDomainHint = deriveLandingDomainHint(redirectChain);
-        const scored = validCandidates
-          .map(u => ({ url: u, score: scoreSalvageCandidate(u, validCandidates, landingDomainHint) }))
-          .filter(x => x.score >= 40)
-          .sort((a, b) => b.score - a.score);
-        if (scored.length > 0) {
-          console.log(`[Extract] URL salvage success: ${scored[0].url} (score=${scored[0].score})`);
-          // GAP-2: Hijack detection before accepting salvaged URL
-          const hijackDomain = detectHijack(redirectChain, allRequestUrls, scored[0].url);
-          if (hijackDomain) {
-            console.warn(`[Extract] Hijack detected (salvage): ${hijackDomain}`);
-            return {
-              success: false,
-              landingPageUrl: null,
-              redirectChain: redirectChain.map(u => normalizeTrackingParams(u)),
-              finalUrl: scored[0].url,
-              usedFallback: false,
-              hijacked: true,
-              hijackDomain,
-            };
-          }
-          return buildBestResult(scored[0].url, redirectChain, affiliateLink, affiliateNetwork, false);
-        }
-        console.warn(`[Extract] URL salvage: no candidate scored >= 40 (${validCandidates.length} candidates tried)`);
+      if (iframeUrl && iframeUrl.startsWith("http")) {
+        try { await page.goto(iframeUrl, { waitUntil: "load", timeout: 30000 }); } catch {}
+        currentUrl = normalizeTrackingParams(page.url());
       }
     }
+  }
 
-    // Playwright failed -> try HTTP fallback
-    console.log("[Extract] Playwright + salvage failed, trying HTTP fallback...");
-    throwIfAborted(signal);
-    try {
-      // GAP-5: Forward referer to HTTP fallback so attribution pixels that
-      // check Referer header still fire correctly when browser path fails.
-      const fallbackResult = await nodeJsFollowRedirects(affiliateLink, 10, referer);
-      if (fallbackResult.url) {
-        const mergedChain = [...redirectChain, ...fallbackResult.redirectChain];
-        const normalizedUrl = normalizeTrackingParams(fallbackResult.url);
-        const validation = validateTrackingParams(normalizedUrl, affiliateNetwork);
+  // Phase 5: Retry goto
+  if (isSameUrl(currentUrl, affiliateLink) || isChromeError(currentUrl)) {
+    try { await page.goto(affiliateLink, { waitUntil: "networkidle", timeout: 30000 }); } catch {}
+    currentUrl = normalizeTrackingParams(page.url());
+    if (!isSameUrl(currentUrl, affiliateLink) && !isChromeError(currentUrl)) {
+      currentUrl = await stabilizeAddressBarUrl(page, currentUrl, 2500);
+    }
+  }
+
+  const changes = await collectUrlChanges(page);
+  await closeBrowser(browser);
+
+  // If Playwright found a landing page, build best result
+  if (!isSameUrl(currentUrl, affiliateLink) && !isChromeError(currentUrl)) {
+    return buildBestResult(currentUrl, redirectChain, affiliateLink, affiliateNetwork, changes, false);
+  }
+
+  // Even if currentUrl is stuck, try building from chain (may have salvageable URLs)
+  const salvageResult = buildBestResult(currentUrl, redirectChain, affiliateLink, affiliateNetwork, changes, false);
+  if (salvageResult.success) {
+    return salvageResult;
+  }
+
+  // Playwright failed -> try HTTP fallback
+  console.log("[Extract] Playwright failed, trying HTTP fallback...");
+  try {
+    const fallbackResult = await nodeJsFollowRedirects(affiliateLink);
+    if (fallbackResult.url) {
+      const mergedChain = [...redirectChain, ...fallbackResult.redirectChain];
+      const fallbackChanges: string[] = [];
+      const fbResult = buildBestResult(fallbackResult.url, mergedChain, affiliateLink, affiliateNetwork, fallbackChanges, true);
+      if (fbResult.success) {
+        return fbResult;
+      }
+      // If buildBestResult failed but we have a URL, return it with raw validation
+      const normalizedUrl = normalizeTrackingParams(fallbackResult.url);
+      const validation = validateTrackingParams(normalizedUrl, affiliateNetwork);
+      if (validation.valid) {
         return {
           success: true,
           landingPageUrl: normalizedUrl,
@@ -1380,39 +1093,30 @@ async function extractOnce(
           finalUrl: normalizedUrl,
           validation,
           usedFallback: true,
+          confidence: 'medium',
+          signature: computeSignature(normalizedUrl),
         };
       }
-    } catch (fallbackErr) {
-      console.warn("[Extract] HTTP fallback also failed:", fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr));
     }
+  } catch (fallbackErr) {
+    console.warn("[Extract] HTTP fallback also failed:", fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr));
+  }
 
-    // All methods failed
-    return {
-      success: false,
-      landingPageUrl: null,
-      redirectChain: redirectChain.map(u => normalizeTrackingParams(u)),
-      finalUrl: null,
-      usedFallback: false,
-    };
-  } catch (err) {
-    // If aborted, treat as timeout
-    if (err instanceof DOMException && err.name === 'AbortError') {
-      console.warn('[Extract] Extraction aborted due to timeout');
-      return {
-        success: false,
-        landingPageUrl: null,
-        redirectChain: redirectChain.map(u => normalizeTrackingParams(u)),
-        finalUrl: null,
-        usedFallback: false,
-      };
-    }
-    throw err; // Re-throw other errors for handleExtract to classify
-  } finally {
-    // P0-3: Always cleanup — close page + context, release browser back to pool
-    try { if (page) await page.close(); } catch {}
-    try { if (context) await closeContext(context); } catch {}
-    browserPool.release(instance);
-    cancelHandle.cleanup();
+  // All methods failed — determine failure type
+  const fallbackChanges: string[] = [];
+  const failResult = buildBestResult(currentUrl, redirectChain, affiliateLink, affiliateNetwork, fallbackChanges, false);
+  return failResult;
+}
+
+/** Collect window.__urlChanges from page */
+async function collectUrlChanges(page: Page): Promise<string[]> {
+  try {
+    const changes = await page.evaluate(() => {
+      return (window as any).__urlChanges as string[] | undefined;
+    });
+    return Array.isArray(changes) ? changes : [];
+  } catch {
+    return [];
   }
 }
 
@@ -1428,28 +1132,8 @@ async function handleExtract(req: Request): Promise<Response> {
   if (!url) return jsonResponse({ success: false, error: "URL is required" }, 400);
   try { new URL(url); } catch { return jsonResponse({ success: false, error: "Invalid URL format" }, 400); }
 
-  const startTime = Date.now();
   try {
     const result = await extractOnce(url, proxy, affiliateNetwork, referer);
-    const elapsed = Date.now() - startTime;
-
-    // GAP-2: Hijack detected → 422 with specific error code so client can
-    // show a friendly "check your browser extensions" message instead of
-    // treating the hijacked URL as a real landing page.
-    if (result.hijacked) {
-      console.warn(`[Extract] Hijack detected in ${elapsed}ms: ${result.hijackDomain}`);
-      return jsonResponse({
-        success: false,
-        error: `检测到劫持域名 ${result.hijackDomain}，请检查浏览器插件`,
-        errorCode: "HIJACKED",
-        hijackDomain: result.hijackDomain,
-        redirectChain: result.redirectChain,
-        finalUrl: result.finalUrl,
-        elapsed,
-      }, 422);
-    }
-
-    console.log(`[Extract] Completed in ${elapsed}ms — success=${result.success}, usedFallback=${result.usedFallback}, redirectChain=${result.redirectChain.length} hops`);
     return jsonResponse({
       success: result.success,
       landingPageUrl: result.landingPageUrl,
@@ -1457,33 +1141,18 @@ async function handleExtract(req: Request): Promise<Response> {
       finalUrl: result.finalUrl,
       validation: result.validation,
       usedFallback: result.usedFallback,
-      elapsed,
+      failureType: result.failureType,
+      hijackedDomain: result.hijackedDomain,
+      confidence: result.confidence,
+      signature: result.signature,
     });
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
-    const elapsed = Date.now() - startTime;
-    console.error(`[Extract] Failed in ${elapsed}ms:`, errMsg);
-
-    // P0-4: Specific error classification for HTTP/2 and tunnel errors
-    if (errMsg.includes("ERR_TUNNEL_CONNECTION_FAILED"))
-      return jsonResponse({
-        success: false,
-        error: "Tunnel connection failed (代理IP段可能被封)",
-        details: errMsg,
-        errorCode: "TUNNEL_FAILED",
-      }, 502);
-    if (errMsg.includes("ERR_HTTP2_PROTOCOL_ERROR"))
-      return jsonResponse({
-        success: false,
-        error: "HTTP/2 protocol error (域名已加入route.fetch名单，重试可成功)",
-        details: errMsg,
-        errorCode: "HTTP2_ERROR",
-      }, 502);
     if (errMsg.includes("proxy") || errMsg.includes("Proxy") || errMsg.includes("ERR_PROXY_CONNECTION_FAILED"))
-      return jsonResponse({ success: false, error: "Proxy connection failed", details: errMsg, errorCode: "PROXY_FAILED" }, 502);
-    if (errMsg.includes("Timeout") || errMsg.includes("timeout") || errMsg.includes("AbortError"))
-      return jsonResponse({ success: false, error: "Page navigation timed out", details: errMsg, errorCode: "TIMEOUT" }, 504);
-    return jsonResponse({ success: false, error: "Extraction failed", details: errMsg, errorCode: "UNKNOWN" }, 500);
+      return jsonResponse({ success: false, error: "Proxy connection failed", details: errMsg }, 502);
+    if (errMsg.includes("Timeout") || errMsg.includes("timeout"))
+      return jsonResponse({ success: false, error: "Page navigation timed out", details: errMsg }, 504);
+    return jsonResponse({ success: false, error: "Extraction failed", details: errMsg }, 500);
   }
 }
 
@@ -1496,7 +1165,6 @@ const PORT = 3001;
 const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url || "/", `http://localhost:${PORT}`);
 
-    // Handle CORS preflight
     if (req.method === "OPTIONS") {
       res.writeHead(204, {
         "Access-Control-Allow-Origin": "*",
@@ -1507,7 +1175,6 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       return;
     }
 
-    // Helper to read request body
     const readBody = (): Promise<string> => {
       return new Promise((resolve) => {
         let body = "";
@@ -1516,7 +1183,6 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       });
     };
 
-    // Helper to send JSON response
     const sendJson = (data: unknown, status = 200) => {
       res.writeHead(status, {
         "Content-Type": "application/json",
@@ -1527,7 +1193,6 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       res.end(JSON.stringify(data));
     };
 
-    // Create a Request-like object for handlers
     const makeRequest = async (): Promise<Request> => {
       const body = await readBody();
       return new Request(`http://localhost:${PORT}${req.url}`, {
@@ -1539,12 +1204,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
 
     try {
       if (url.pathname === "/health" && req.method === "GET") {
-        sendJson({
-          status: "ok",
-          timestamp: Date.now(),
-          pool: browserPool.getStats(),
-          runtimeBlockedDomains: Array.from(runtimeBlockedDomains),
-        });
+        sendJson({ status: "ok", timestamp: Date.now() });
       } else if (url.pathname === "/api/extract" && req.method === "POST") {
         const request = await makeRequest();
         const response = await handleExtract(request);
@@ -1559,7 +1219,6 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
     }
   });
 
-// Prevent the process from dying on unhandled errors
 process.on("uncaughtException", (err) => {
   console.error("[UNCAUGHT EXCEPTION]", err);
 });
@@ -1568,29 +1227,6 @@ process.on("unhandledRejection", (reason) => {
   console.error("[UNHANDLED REJECTION]", reason);
 });
 
-// P0-3: Watchdog — hard kill after WATCHDOG_TIMEOUT_MS (6min) to let Railway
-// restart the container. This prevents drift from accumulated leaks that
-// survive the per-request AbortController cleanup.
-// The watchdog only triggers if the process has been running for the full
-// duration without restart — normal short-lived operations never see it.
-let lastActivityAt = Date.now();
-function bumpActivity() { lastActivityAt = Date.now(); }
-setInterval(() => {
-  const idle = Date.now() - lastActivityAt;
-  // Only exit if process has been continuously running (not idle) for too long
-  // We track "running" as: HTTP server has handled a request recently OR
-  // browser pool has active instances. If both idle, no need to restart.
-  const poolStats = browserPool.getStats();
-  if (poolStats.inUse > 0 && idle > WATCHDOG_TIMEOUT_MS) {
-    console.error(`[Watchdog] Process has been busy for ${idle}ms with ${poolStats.inUse} active browsers — forcing restart`);
-    process.exit(1);
-  }
-}, 60_000).unref?.();
-
-// Bump activity on every request so watchdog knows we're alive
-server.on('request', () => bumpActivity());
-
 server.listen(PORT, () => {
   console.log(`Scraper service running on port ${PORT}`);
-  console.log(`[Config] BROWSER_POOL_MAX=${BROWSER_POOL_MAX}, EXTRACTOR_TIMEOUT=${EXTRACTOR_TIMEOUT_MS}ms, WATCHDOG=${WATCHDOG_TIMEOUT_MS}ms`);
 });
